@@ -1,0 +1,31 @@
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Oracle DB driver — thin mode (no Oracle Client install needed)
+# python-oracledb==2.1.2
+oracledb==4.0.0
+
+# Neo4j graph driver
+neo4j==5.19.0
+
+# Google Gemini SDK
+google-generativeai==0.7.2
+
+# Config and validation
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+
+# HTTP client (Streamlit → FastAPI)
+httpx==0.27.0
+
+# Frontend
+streamlit==1.35.0
+
+# Data handling and output
+pandas==2.2.2
+plotly==5.22.0
+openpyxl==3.1.2
+
+# SQL validation
+sqlglot==25.5.0
