@@ -6,11 +6,10 @@ from backend.services.neo4j_service import close_driver
 
 app = FastAPI(
     title="NL-SQL Banking API",
-    description="Natural language to Oracle SQL — powered by GraphRAG + Gemini",
-    version="1.0.0",
+    description="Natural language → Oracle SQL — GraphRAG + Gemini + multi-DB",
+    version="2.0.0",
 )
 
-# Allow Streamlit frontend on default port
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8501"],
@@ -24,10 +23,7 @@ app.include_router(schema.router, prefix="/api")
 
 @app.exception_handler(Exception)
 async def global_error_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=200,
-        content={"error": True, "detail": str(exc)},
-    )
+    return JSONResponse(status_code=200, content={"error": True, "detail": str(exc)})
 
 
 @app.on_event("shutdown")
