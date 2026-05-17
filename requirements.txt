@@ -14,6 +14,7 @@ google-generativeai==0.7.2
 # Config and validation
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
+PyYAML==6.0.1
 
 # HTTP client (Streamlit → FastAPI)
 httpx==0.27.0
