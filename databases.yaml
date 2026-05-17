@@ -1,0 +1,73 @@
+# databases.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Register every Oracle database the app can query.
+# Credentials are NOT stored here — use env_prefix to map to .env variables.
+#
+# Convention:  env_prefix = FINCORE  →  FINCORE_USER / FINCORE_PASSWORD / FINCORE_DSN
+#
+# cross_db_links: define known logical joins between tables in DIFFERENT databases.
+# These become (:Table)-[:CROSS_DB_JOIN]->(:Table) edges in Neo4j and surface
+# as join hints when Gemini generates SQL spanning multiple systems.
+# ─────────────────────────────────────────────────────────────────────────────
+
+databases:
+  - id: fincore
+    name: "Core Banking"
+    env_prefix: FINCORE
+    schema: HR
+    description: >
+      Core banking system — loans, CASA, financial transactions, GL entries,
+      branch master data and customer KYC.
+    domains:
+      - name: Lending
+        hint: "Loan origination, disbursement schedules, EMI collections, outstanding balances"
+      - name: CASA
+        hint: "Current accounts, savings accounts, CASA balances, account status"
+      - name: Transactions
+        hint: "Financial transactions, debit/credit entries, transaction amounts FCY/LCY"
+      - name: General Ledger
+        hint: "GL accounts, chart of accounts, debit/credit entries, trial balance"
+      - name: Customers
+        hint: "Customer master, KYC, segment classification, relationship manager"
+      - name: Branch
+        hint: "Branch master, region, zone, branch codes"
+
+  - id: riskdb
+    name: "Risk Management"
+    env_prefix: RISKDB
+    schema: AV
+    description: >
+      Risk management system — NPA classification, credit ratings,
+      exposure reporting, market risk and provisioning.
+    domains:
+      - name: NPA
+        hint: "Non-performing assets, overdue days, NPA classification, provision amounts"
+      - name: Credit Risk
+        hint: "Credit ratings, borrower-wise limits, sanctioned vs outstanding exposure"
+      - name: Market Risk
+        hint: "Foreign exchange positions, interest rate sensitivity, VaR"
+      - name: Provisioning
+        hint: "Provision amounts, expected credit loss, IFRS9 staging"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-database logical relationships.
+# These are NOT enforced FK constraints — they represent known business joins
+# that span multiple Oracle instances (e.g. a loan in FINCORE links to its
+# NPA record in RISKDB via the same LOAN_ACCT_NO).
+# ─────────────────────────────────────────────────────────────────────────────
+cross_db_links:
+  - from_db: fincore
+    from_table: LOAN_MASTER
+    from_col: LOAN_ACCT_NO
+    to_db: riskdb
+    to_table: NPA_MASTER
+    to_col: LOAN_ACCT_NO
+    description: "Loans in core banking that are classified as NPA in risk system"
+
+  - from_db: fincore
+    from_table: CUST_MASTER
+    from_col: CUST_ID
+    to_db: riskdb
+    to_table: CREDIT_RATING
+    to_col: CUST_ID
+    description: "Customer credit ratings maintained in risk system for core banking customers"

@@ -1,10 +1,14 @@
+"""
+backend/routes/schema.py  (v2 — multi-DB)
+"""
+
 from fastapi import APIRouter
+from backend.db_manager import db_manager
 from backend.services.neo4j_service import get_schema_summary
-from backend.models import SchemaResponse, TableSummary
+from backend.models import SchemaResponse, DatabaseSummary, DomainSummary, TableSummary
 
 router = APIRouter()
 
-# Realistic banking example questions for the UI sidebar
 EXAMPLE_QUESTIONS = [
     "Show total loan disbursements by branch for the current quarter",
     "List all transactions above ₹10 lakh in the last 30 days",
@@ -18,21 +22,84 @@ EXAMPLE_QUESTIONS = [
 
 @router.get("/health")
 async def health():
-    return {"status": "ok"}
+    dbs = [{"id": d.id, "name": d.name, "configured": d.is_configured}
+           for d in db_manager.databases]
+    return {"status": "ok", "databases": dbs}
 
 
 @router.get("/schema", response_model=SchemaResponse)
 async def schema():
-    data = await get_schema_summary()
-    tables = [
-        TableSummary(
-            name=t["name"],
-            description=t.get("description") or "No description available",
-            column_count=t.get("column_count", 0),
-        )
-        for t in data.get("tables", [])
-    ]
-    return SchemaResponse(tables=tables, total_tables=len(tables))
+    """
+    Return all databases with their enriched tables and business domains.
+    Data comes from Neo4j — no Oracle queries at UI load time.
+    """
+    raw = await get_schema_summary()
+    db_summaries: list[DatabaseSummary] = []
+
+    for db_raw in raw.get("databases", []):
+        db_id   = db_raw.get("id", "")
+        tables  = db_raw.get("tables", []) or []
+        domains = db_raw.get("domains", []) or []
+
+        # Deduplicate tables (Cypher collect() may produce nulls)
+        seen: set[str] = set()
+        table_summaries: list[TableSummary] = []
+        for t in tables:
+            if not t or not t.get("name"):
+                continue
+            if t["name"] in seen:
+                continue
+            seen.add(t["name"])
+            table_summaries.append(TableSummary(
+                name=t["name"],
+                description=t.get("description") or "",
+                column_count=0,      # populated by get_table_details at query time
+                is_view=bool(t.get("is_view", False)),
+                row_count_approx=int(t.get("row_count") or 0),
+                domain=t.get("domain") or "",
+            ))
+
+        # Deduplicate domains
+        seen_d: set[str] = set()
+        domain_summaries: list[DomainSummary] = []
+        for d in domains:
+            if not d or not d.get("name") or d["name"] in seen_d:
+                continue
+            seen_d.add(d["name"])
+            domain_summaries.append(DomainSummary(
+                name=d["name"],
+                hint=d.get("hint") or "",
+            ))
+
+        # Fallback description from db_manager config
+        try:
+            cfg = db_manager.get_config(db_id)
+            desc = cfg.description
+        except Exception:
+            desc = db_raw.get("description") or ""
+
+        db_summaries.append(DatabaseSummary(
+            id=db_id,
+            name=db_raw.get("name") or db_id,
+            description=desc,
+            table_count=int(db_raw.get("table_count") or len(table_summaries)),
+            domains=domain_summaries,
+            tables=table_summaries,
+        ))
+
+    return SchemaResponse(databases=db_summaries, total_databases=len(db_summaries))
+
+
+@router.get("/databases")
+async def databases():
+    """Quick list of registered databases for the UI DB-selector dropdown."""
+    return {
+        "databases": [
+            {"id": d.id, "name": d.name, "description": d.description,
+             "configured": d.is_configured}
+            for d in db_manager.databases
+        ]
+    }
 
 
 @router.get("/examples")
