@@ -1,17 +1,12 @@
 """
-backend/services/gemini_service.py
-------------------------------------
-All Gemini API interactions:
-  - get_embedding()     → text-embedding-004 (768 dims) for GraphRAG
-  - enrich_columns()    → cryptic column names → business labels (ingestion time)
-  - generate_sql()      → NL question + schema context → Oracle SQL
-  - summarize_results() → aggregated stats → plain English summary
+backend/services/gemini_service.py  (v2)
 
-DATA PRIVACY GUARANTEE:
-  - enrich_columns: sends only column names + data types (schema metadata)
-  - generate_sql:   sends only table/column names + enriched descriptions
-  - summarize_results: sends only aggregate statistics (sum/avg/min/max/count)
-  - RAW ROW DATA NEVER LEAVES ON-PREM
+Changes from v1:
+  - generate_sql() accepts matched_patterns (from QueryPattern nodes) and
+    injects them as dynamic few-shot examples — the SQL improves as patterns
+    accumulate.
+  - All functions remain data-privacy safe: only schema metadata and
+    aggregate stats reach Gemini; raw row data never leaves on-prem.
 """
 
 import json
@@ -29,10 +24,7 @@ _flash = genai.GenerativeModel("gemini-flash-latest")
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 def get_embedding(text: str) -> list[float]:
-    """
-    Generate a 768-dimensional embedding using text-embedding-004.
-    Used for both ingestion (schema nodes) and query-time (NL question).
-    """
+    """768→3072-dim embedding via gemini-embedding-001."""
     result = genai.embed_content(
         model="models/gemini-embedding-001",
         content=text,
@@ -41,19 +33,23 @@ def get_embedding(text: str) -> list[float]:
     return result["embedding"]
 
 
-# ── Schema enrichment (ingestion time) ───────────────────────────────────────
+# ── Column enrichment (ingestion time) ────────────────────────────────────────
 
 def enrich_columns(
-    table_name: str, table_comment: str, columns: list[dict]
+    table_name: str,
+    table_comment: str,
+    columns: list[dict],
+    db_name: str = "",
+    domain_hint: str = "",
 ) -> list[dict]:
     """
-    Send a batch of cryptic column names to Gemini and receive
-    human-readable labels and descriptions in return.
-
-    Only schema metadata is sent — no actual data values.
-    Called once per table during ingestion, not at query time.
+    Batch-enrich cryptic column names with business labels + descriptions.
+    Sends only column names and data types — no actual data values.
+    db_name and domain_hint give Gemini richer context for domain-specific
+    abbreviations (e.g. NPA / ECL / PD in a risk database).
     """
-    prompt = build_enrichment_prompt(table_name, table_comment, columns)
+    prompt = build_enrichment_prompt(table_name, table_comment, columns,
+                                     db_name=db_name, domain_hint=domain_hint)
     response = _flash.generate_content(
         prompt,
         generation_config=genai.types.GenerationConfig(
@@ -62,19 +58,16 @@ def enrich_columns(
         ),
     )
     try:
-        # Strip accidental markdown fences if present
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"^```(?:json)?\s*", "", response.text.strip())
         raw = re.sub(r"\s*```$", "", raw)
         return json.loads(raw)
-    except (json.JSONDecodeError, Exception):
-        # Fallback: return columns with minimal enrichment
+    except Exception:
         return [
             {
-                "column": c["column_name"],
-                "label": c["column_name"].replace("_", " ").title(),
+                "column":      c["column_name"],
+                "label":       c["column_name"].replace("_", " ").title(),
                 "description": c.get("col_comment") or c["column_name"],
-                "is_pii": False,
+                "is_pii":      False,
             }
             for c in columns
         ]
@@ -85,34 +78,52 @@ def enrich_columns(
 async def generate_sql(
     question: str,
     schema_context: str,
+    db_name: str,
     conversation_history: list[dict] | None = None,
+    matched_patterns: list[dict] | None = None,
 ) -> dict:
     """
-    Generate Oracle SQL from a natural language question and schema context.
+    Generate Oracle SQL from NL question + schema context.
 
-    conversation_history: list of {"role": "user"|"model", "content": "..."}
-    Enables multi-turn refinement (e.g. "now filter by branch X").
+    matched_patterns: QueryPattern nodes retrieved from Neo4j that are
+    semantically similar to the current question.  Their stored SQL is
+    injected as dynamic few-shot examples — the more patterns accumulate,
+    the more accurate generation becomes.
 
-    ONLY schema metadata is sent to Gemini — never raw Oracle data.
+    Only schema metadata is sent to Gemini. Raw data never leaves on-prem.
     """
     model = genai.GenerativeModel(
         "gemini-flash-latest",
         system_instruction=SQL_SYSTEM_PROMPT,
     )
 
-    # Build Gemini chat history from conversation turns
-    history = []
-    for turn in (conversation_history or []):
-        history.append({
-            "role": turn["role"],
-            "parts": [turn["content"]],
-        })
+    # Build dynamic few-shot block from matched QueryPatterns
+    few_shot_block = ""
+    if matched_patterns:
+        examples = []
+        for p in matched_patterns[:3]:   # at most 3 examples
+            examples.append(
+                f"Q: {p['nl_question']}\n"
+                f"SQL:\n{p['sql']}"
+            )
+        few_shot_block = (
+            "\n\n── Matched patterns from query history "
+            f"(use as additional few-shot examples) ──\n"
+            + "\n\n".join(examples)
+            + "\n── End of matched patterns ──\n"
+        )
 
+    # Build chat history for multi-turn refinement
+    history = [
+        {"role": t["role"], "parts": [t["content"]]}
+        for t in (conversation_history or [])
+    ]
     chat = model.start_chat(history=history)
 
     user_message = (
-        f"Schema context (table/column metadata only — no actual data):\n"
-        f"{schema_context}\n\n"
+        f"Database: {db_name}\n\n"
+        f"Schema context (metadata only — no actual data):\n{schema_context}"
+        f"{few_shot_block}\n\n"
         f"Question: {question}\n\n"
         f"Generate Oracle SQL only. No explanation, no markdown, no code fences."
     )
@@ -123,29 +134,25 @@ async def generate_sql(
     )
 
     sql = response.text.strip()
-    # Clean up any accidental markdown the model might add
     sql = re.sub(r"^```(?:sql|oracle|plsql)?\s*", "", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\s*```$", "", sql)
-    sql = sql.strip()
+    sql = re.sub(r"\s*```$", "", sql).strip()
 
     return {"sql": sql, "model": "gemini-flash-latest"}
 
 
-# ── Result summarization (query time) ────────────────────────────────────────
+# ── Result summarization (query time) ─────────────────────────────────────────
 
 async def summarize_results(
     question: str,
     columns: list[str],
     row_count: int,
     summary_stats: dict,
+    db_name: str,
 ) -> str:
     """
-    Generate a plain English summary of query results.
-
-    PRIVACY: Only aggregate statistics (sum, avg, min, max, unique counts)
-    are sent to Gemini — never actual row values.
+    Produce a plain-English summary from aggregated statistics only.
+    Individual row values are never sent to Gemini.
     """
-    # Format stats readably
     stats_lines = [f"Total rows returned: {row_count}"]
     for col, stat in summary_stats.items():
         if col == "row_count":
@@ -158,18 +165,18 @@ async def summarize_results(
         elif "unique_values" in stat:
             stats_lines.append(f"{col}: {stat['unique_values']} unique values")
 
-    prompt = f"""A business user in a bank asked: "{question}"
-
-The query executed successfully. Here are the AGGREGATED results (no individual records):
-Columns returned: {', '.join(columns)}
-{chr(10).join(stats_lines)}
-
-Write a concise, business-friendly answer in 2-3 sentences:
-- Lead with the key finding or headline number
-- Use ₹ for monetary amounts and crore/lakh denomination where appropriate
-- Mention any notable pattern (e.g. top value, trend direction) if inferable from stats
-- Do NOT mention SQL, database, or technical terms
-- Do NOT say "based on the data" or "the results show" — just state the finding directly"""
+    prompt = (
+        f'A business user querying the "{db_name}" database asked: "{question}"\n\n'
+        f"Query executed successfully. Aggregated result statistics (no individual records):\n"
+        f"Columns: {', '.join(columns)}\n"
+        + "\n".join(stats_lines)
+        + "\n\nWrite a concise, business-friendly answer in 2-3 sentences:\n"
+        "- Lead with the key headline number or finding\n"
+        "- Use ₹ for monetary amounts; use crore/lakh denomination where appropriate\n"
+        "- Mention any notable trend or outlier if inferable from min/max/avg\n"
+        "- Never mention SQL, database, or technical terms\n"
+        "- Never start with 'Based on the data' or 'The results show'"
+    )
 
     response = await _flash.generate_content_async(prompt)
     return response.text.strip()
