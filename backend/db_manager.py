@@ -15,13 +15,13 @@ One oracledb connection pool is created lazily per database on first use.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded before config parsing
+load_dotenv()
 
 import yaml
 import oracledb
-from dotenv import load_dotenv
-
-load_dotenv()
-
 
 
 @dataclass
