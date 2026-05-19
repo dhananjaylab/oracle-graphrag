@@ -1,38 +1,23 @@
 """
-backend/services/neo4j_service.py  (v2 — enriched multi-DB graph)
+backend/services/neo4j_service.py  (v2 + Phase 3A feedback)
 
-Graph schema:
-  (:Database  {id, name, schema, description, last_ingested, table_count})
-  (:Table     {name, database_id, schema_name, enriched_description, embedding,
-               is_view, row_count_approx, pk_columns, updated_at})
-  (:Column    {name, table_name, database_id, data_type, nullable, label,
-               enriched_description, embedding, is_pk, is_unique, is_indexed,
-               is_pii, cardinality_hint})
-  (:Index     {name, table_name, database_id, columns, is_unique, index_type})
-  (:BusinessDomain {name, database_id, hint})
-  (:QueryPattern   {id, database_id, nl_question, sql, schema_cypher,
-                    tables_used, success_count, avg_execution_ms, embedding,
-                    created_at, last_used})
+New in Phase 3A:
+  increment_pattern_success()  — thumbs up → raise pattern weight
+  decrement_pattern_success()  — thumbs down → lower pattern weight
+  update_pattern_sql()         — user supplies corrected SQL → replace stored SQL
 
-  Relationships:
-    (:Database)-[:HAS_TABLE]->(:Table)
-    (:Table)-[:HAS_COLUMN]->(:Column)
-    (:Table)-[:FK_TO {from_col, to_col}]->(:Table)
-    (:Table)-[:HAS_INDEX]->(:Index)
-    (:Table)-[:IN_DOMAIN]->(:BusinessDomain)
-    (:BusinessDomain)-[:BELONGS_TO]->(:Database)
-    (:QueryPattern)-[:QUERIES]->(:Table)
-    (:QueryPattern)-[:FOR_DB]->(:Database)
-    (:Table)-[:CROSS_DB_JOIN {from_col, to_col, description}]->(:Table)
+All other functions unchanged from v2.
 """
 
 import uuid
 from datetime import datetime, timezone
+
 from neo4j import AsyncGraphDatabase
+
 from backend.config import settings
 
-_driver = None
-EMBED_DIMS = 3072   # gemini-embedding-001
+_driver      = None
+EMBED_DIMS   = 3072   # gemini-embedding-001
 
 
 def get_driver():
@@ -53,58 +38,46 @@ async def close_driver():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY-TIME: Pattern retrieval (with preserved Cypher)
+# QUERY-TIME — pattern retrieval
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def search_similar_patterns(
     query_embedding: list[float],
-    database_id: str,
-    top_k: int = 3,
-    min_similarity: float = 0.85,
+    database_id:     str,
+    top_k:           int   = 3,
+    min_similarity:  float = 0.85,
 ) -> list[dict]:
-    """
-    Find past successful QueryPattern nodes similar to the current question.
-    Returns stored SQL AND the schema_cypher that was used — so we reuse both
-    the few-shot SQL example and the schema discovery Cypher.
-    """
     cypher = """
         CALL db.index.vector.queryNodes('pattern_embeddings', $k, $embedding)
         YIELD node, score
         WHERE node.database_id = $db_id AND score >= $min_sim
-        RETURN
-            node.nl_question   AS nl_question,
-            node.sql           AS sql,
-            node.schema_cypher AS schema_cypher,
-            node.tables_used   AS tables_used,
-            node.success_count AS success_count,
-            score
+        RETURN node.nl_question   AS nl_question,
+               node.sql           AS sql,
+               node.schema_cypher AS schema_cypher,
+               node.tables_used   AS tables_used,
+               node.success_count AS success_count,
+               score
         ORDER BY score DESC
         LIMIT $k
     """
     driver = get_driver()
     async with driver.session() as session:
         result = await session.run(
-            cypher,
-            k=top_k, embedding=query_embedding,
+            cypher, k=top_k, embedding=query_embedding,
             db_id=database_id, min_sim=min_similarity,
         )
         return await result.data()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY-TIME: Schema discovery
+# QUERY-TIME — schema discovery
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def semantic_schema_search(
     query_embedding: list[float],
-    database_id: str,
-    top_k: int = 12,
+    database_id:     str,
+    top_k:           int = 12,
 ) -> dict:
-    """
-    Vector similarity search on Table and Column nodes, scoped to one database.
-    Also returns the Cypher queries themselves so they can be preserved in the
-    QueryPattern node for future reuse and debugging.
-    """
     table_cypher = """CALL db.index.vector.queryNodes('table_embeddings', $k, $embedding)
 YIELD node, score
 WHERE node.database_id = $db_id
@@ -122,47 +95,44 @@ ORDER BY score DESC"""
 
     driver = get_driver()
     async with driver.session() as session:
-        t_res  = await session.run(table_cypher, k=top_k, embedding=query_embedding, db_id=database_id)
-        tables = await t_res.data()
-        c_res   = await session.run(col_cypher,  k=top_k, embedding=query_embedding, db_id=database_id)
+        t_res   = await session.run(table_cypher, k=top_k, embedding=query_embedding, db_id=database_id)
+        tables  = await t_res.data()
+        c_res   = await session.run(col_cypher,   k=top_k, embedding=query_embedding, db_id=database_id)
         columns = await c_res.data()
 
-    combined_cypher = f"-- Table search:\n{table_cypher}\n\n-- Column search:\n{col_cypher}"
     return {
         "tables":      tables,
         "columns":     columns,
-        "cypher_used": combined_cypher,   # preserved for QueryPattern
+        "cypher_used": f"-- Table search:\n{table_cypher}\n\n-- Column search:\n{col_cypher}",
     }
 
 
 async def get_table_details(table_names: list[str], database_id: str) -> list[dict]:
-    """Full column + domain metadata for schema context sent to Gemini."""
     if not table_names:
         return []
     cypher = """
         MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
         WHERE t.name IN $tables AND t.database_id = $db_id
         OPTIONAL MATCH (t)-[:IN_DOMAIN]->(d:BusinessDomain)
-        RETURN
-            t.name                 AS table_name,
-            t.schema_name          AS schema_name,
-            t.enriched_description AS table_description,
-            t.is_view              AS is_view,
-            t.row_count_approx     AS row_count_approx,
-            t.pk_columns           AS pk_columns,
-            d.name                 AS domain_name,
-            collect({
-                name:             c.name,
-                data_type:        c.data_type,
-                nullable:         c.nullable,
-                label:            c.label,
-                description:      c.enriched_description,
-                is_pii:           c.is_pii,
-                is_pk:            c.is_pk,
-                is_unique:        c.is_unique,
-                is_indexed:       c.is_indexed,
-                cardinality_hint: c.cardinality_hint
-            }) AS columns
+        RETURN t.name                 AS table_name,
+               t.schema_name          AS schema_name,
+               t.enriched_description AS table_description,
+               t.is_view              AS is_view,
+               t.row_count_approx     AS row_count_approx,
+               t.pk_columns           AS pk_columns,
+               d.name                 AS domain_name,
+               collect({
+                   name:             c.name,
+                   data_type:        c.data_type,
+                   nullable:         c.nullable,
+                   label:            c.label,
+                   description:      c.enriched_description,
+                   is_pii:           c.is_pii,
+                   is_pk:            c.is_pk,
+                   is_unique:        c.is_unique,
+                   is_indexed:       c.is_indexed,
+                   cardinality_hint: c.cardinality_hint
+               }) AS columns
         ORDER BY t.name
     """
     driver = get_driver()
@@ -178,9 +148,9 @@ async def get_join_path(table1: str, table2: str, database_id: str) -> list[dict
             -[:FK_TO*1..5]-
             (t2:Table {name: $t2, database_id: $db_id})
         )
-        RETURN
-            [n IN nodes(path) | n.name] AS table_sequence,
-            [r IN relationships(path) | {from_col: r.from_col, to_col: r.to_col}] AS join_conditions
+        RETURN [n IN nodes(path) | n.name] AS table_sequence,
+               [r IN relationships(path) | {from_col: r.from_col, to_col: r.to_col}]
+               AS join_conditions
         LIMIT 1
     """
     driver = get_driver()
@@ -190,7 +160,6 @@ async def get_join_path(table1: str, table2: str, database_id: str) -> list[dict
 
 
 async def get_cross_db_hints(table_names: list[str], database_id: str) -> list[dict]:
-    """Surface cross-DB join hints for the candidate tables."""
     cypher = """
         MATCH (t1:Table)-[r:CROSS_DB_JOIN]->(t2:Table)
         WHERE t1.name IN $tables AND t1.database_id = $db_id
@@ -205,7 +174,6 @@ async def get_cross_db_hints(table_names: list[str], database_id: str) -> list[d
 
 
 async def get_schema_summary() -> dict:
-    """All databases with tables and domains — for the UI schema explorer."""
     cypher = """
         MATCH (db:Database)
         OPTIONAL MATCH (t:Table {database_id: db.id})
@@ -230,24 +198,19 @@ async def get_schema_summary() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY PATTERN STORAGE (preserves Cypher + SQL after successful execution)
+# QUERY PATTERN STORAGE — preserve SQL + Cypher after successful execution
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def store_query_pattern(
-    database_id: str,
-    nl_question: str,
-    sql: str,
-    schema_cypher: str,          # ← the Cypher that found the schema context
-    tables_used: list[str],
+    database_id:  str,
+    nl_question:  str,
+    sql:          str,
+    schema_cypher: str,
+    tables_used:  list[str],
     execution_ms: int,
-    embedding: list[float],
+    embedding:    list[float],
 ) -> None:
-    """
-    Persist a successful NL→SQL exchange as a QueryPattern node.
-    schema_cypher is stored verbatim so future retrieval can reuse or display it.
-    Duplicate questions increment success_count with a running-average exec time.
-    """
-    now = datetime.now(timezone.utc).isoformat()
+    now    = datetime.now(timezone.utc).isoformat()
     cypher = """
         MERGE (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
         ON CREATE SET
@@ -287,20 +250,108 @@ async def store_query_pattern(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INGESTION-TIME FUNCTIONS
+# PHASE 3A — FEEDBACK FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def increment_pattern_success(nl_question: str, database_id: str) -> bool:
+    """
+    Thumbs-up feedback: raise the pattern's success_count by 1.
+    Higher success_count → pattern ranks higher in future similarity searches.
+    Returns True if the pattern was found and updated.
+    """
+    now    = datetime.now(timezone.utc).isoformat()
+    cypher = """
+        MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
+        SET qp.success_count = qp.success_count + 1,
+            qp.last_used     = $now
+        RETURN count(qp) AS updated
+    """
+    driver = get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, nl=nl_question, db_id=database_id, now=now)
+        data   = await result.single()
+        return bool(data and data["updated"] > 0)
+
+
+async def decrement_pattern_success(nl_question: str, database_id: str) -> bool:
+    """
+    Thumbs-down feedback: lower the pattern's success_count.
+    Count never goes below 0 — pattern is not deleted, just de-weighted.
+    Returns True if the pattern was found and updated.
+    """
+    now    = datetime.now(timezone.utc).isoformat()
+    cypher = """
+        MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
+        SET qp.success_count = CASE
+                WHEN qp.success_count > 1 THEN qp.success_count - 1
+                ELSE 0
+            END,
+            qp.last_used = $now
+        RETURN count(qp) AS updated
+    """
+    driver = get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, nl=nl_question, db_id=database_id, now=now)
+        data   = await result.single()
+        return bool(data and data["updated"] > 0)
+
+
+async def update_pattern_sql(
+    nl_question:   str,
+    database_id:   str,
+    corrected_sql: str,
+) -> bool:
+    """
+    User-supplied corrected SQL: replace the stored SQL in the QueryPattern.
+    Also bumps success_count so the corrected version ranks higher.
+    Returns True if the pattern was found and updated.
+    """
+    now    = datetime.now(timezone.utc).isoformat()
+    cypher = """
+        MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
+        SET qp.sql           = $corrected_sql,
+            qp.success_count = qp.success_count + 2,   /* reward user-corrected patterns */
+            qp.last_used     = $now
+        RETURN count(qp) AS updated
+    """
+    driver = get_driver()
+    async with driver.session() as session:
+        result = await session.run(
+            cypher, nl=nl_question, db_id=database_id,
+            corrected_sql=corrected_sql, now=now,
+        )
+        data = await result.single()
+        return bool(data and data["updated"] > 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INGESTION-TIME FUNCTIONS (unchanged from v2)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def create_indexes(session) -> None:
     for idx in ("table_embeddings", "column_embeddings", "pattern_embeddings"):
         await session.run(f"DROP INDEX {idx} IF EXISTS")
-    for label, idx in [("Table","table_embeddings"),("Column","column_embeddings"),("QueryPattern","pattern_embeddings")]:
+    for label, idx in [
+        ("Table",        "table_embeddings"),
+        ("Column",       "column_embeddings"),
+        ("QueryPattern", "pattern_embeddings"),
+    ]:
         await session.run(f"""
             CREATE VECTOR INDEX {idx} IF NOT EXISTS
             FOR (n:{label}) ON (n.embedding)
-            OPTIONS {{indexConfig: {{`vector.dimensions`: {EMBED_DIMS}, `vector.similarity_function`: 'cosine'}}}}
+            OPTIONS {{indexConfig: {{
+                `vector.dimensions`: {EMBED_DIMS},
+                `vector.similarity_function`: 'cosine'
+            }}}}
         """)
-    await session.run("CREATE CONSTRAINT table_db_unique IF NOT EXISTS FOR (t:Table) REQUIRE (t.name, t.database_id) IS UNIQUE")
-    await session.run("CREATE CONSTRAINT db_id_unique IF NOT EXISTS FOR (db:Database) REQUIRE db.id IS UNIQUE")
+    await session.run(
+        "CREATE CONSTRAINT table_db_unique IF NOT EXISTS "
+        "FOR (t:Table) REQUIRE (t.name, t.database_id) IS UNIQUE"
+    )
+    await session.run(
+        "CREATE CONSTRAINT db_id_unique IF NOT EXISTS "
+        "FOR (db:Database) REQUIRE db.id IS UNIQUE"
+    )
 
 
 async def upsert_database(session, db_id, name, schema, description, table_count):
@@ -323,12 +374,14 @@ async def upsert_table(session, name, database_id, schema_name, description,
                         enriched_description, embedding, is_view, row_count_approx, pk_columns):
     await session.run("""
         MERGE (t:Table {name: $name, database_id: $db_id})
-        SET t.schema_name=$schema_name, t.description=$desc, t.enriched_description=$edesc,
-            t.embedding=$emb, t.is_view=$is_view, t.row_count_approx=$rc,
+        SET t.schema_name=$schema_name, t.description=$desc,
+            t.enriched_description=$edesc, t.embedding=$emb,
+            t.is_view=$is_view, t.row_count_approx=$rc,
             t.pk_columns=$pk, t.updated_at=datetime()
         WITH t MATCH (db:Database {id: $db_id}) MERGE (db)-[:HAS_TABLE]->(t)
     """, name=name, db_id=database_id, schema_name=schema_name, desc=description,
-        edesc=enriched_description, emb=embedding, is_view=is_view, rc=row_count_approx, pk=pk_columns)
+         edesc=enriched_description, emb=embedding, is_view=is_view,
+         rc=row_count_approx, pk=pk_columns)
 
 
 async def upsert_column(session, table_name, database_id, col_name, data_type, nullable,
@@ -343,19 +396,20 @@ async def upsert_column(session, table_name, database_id, col_name, data_type, n
             c.cardinality_hint=$cardinality_hint, c.embedding=$emb
         MERGE (t)-[:HAS_COLUMN]->(c)
     """, tname=table_name, db_id=database_id, cname=col_name, dtype=data_type,
-        nullable=nullable, label=label, edesc=enriched_description, is_pii=is_pii,
-        is_pk=is_pk, is_unique=is_unique, is_indexed=is_indexed,
-        cardinality_hint=cardinality_hint, emb=embedding)
+         nullable=nullable, label=label, edesc=enriched_description, is_pii=is_pii,
+         is_pk=is_pk, is_unique=is_unique, is_indexed=is_indexed,
+         cardinality_hint=cardinality_hint, emb=embedding)
 
 
 async def upsert_index(session, table_name, database_id, index_name, columns, is_unique, index_type):
     await session.run("""
         MATCH (t:Table {name: $tname, database_id: $db_id})
         MERGE (idx:Index {name: $iname, database_id: $db_id})
-        SET idx.table_name=$tname, idx.columns=$cols, idx.is_unique=$is_unique, idx.index_type=$itype
+        SET idx.table_name=$tname, idx.columns=$cols,
+            idx.is_unique=$is_unique, idx.index_type=$itype
         MERGE (t)-[:HAS_INDEX]->(idx)
     """, tname=table_name, db_id=database_id, iname=index_name,
-        cols=columns, is_unique=is_unique, itype=index_type)
+         cols=columns, is_unique=is_unique, itype=index_type)
 
 
 async def upsert_fk(session, from_table, to_table, from_col, to_col, database_id):
@@ -382,4 +436,4 @@ async def upsert_cross_db_link(session, from_table, from_db, from_col,
         MERGE (t1)-[r:CROSS_DB_JOIN {from_col: $fc, to_col: $tc}]->(t2)
         SET r.description=$desc
     """, ft=from_table, fdb=from_db, fc=from_col,
-        tt=to_table, tdb=to_db, tc=to_col, desc=description)
+         tt=to_table, tdb=to_db, tc=to_col, desc=description)

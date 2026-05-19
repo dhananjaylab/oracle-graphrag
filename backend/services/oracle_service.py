@@ -68,11 +68,8 @@ def execute_sql(db_id: str, sql: str, max_rows: int = 1000) -> dict:
     sql, pii_warnings = detect_and_mask_pii(sql)
     sql = inject_row_limit(sql, max_rows)
 
-    cfg = db_manager.get_config(db_id)
     pool = db_manager.get_pool(db_id)
     with pool.acquire() as conn:
-        if cfg.qualified_schema:
-            conn.current_schema = cfg.qualified_schema
         with conn.cursor() as cur:
             cur.execute(sql)
             columns = [c[0] for c in cur.description]
@@ -125,8 +122,6 @@ def get_data_dictionary(db_id: str, schema: str | None = None) -> dict:
     pool = db_manager.get_pool(db_id)
 
     with pool.acquire() as conn:
-        if sf:
-            conn.current_schema = sf
         with conn.cursor() as cur:
 
             # ── Columns ────────────────────────────────────────────────────
