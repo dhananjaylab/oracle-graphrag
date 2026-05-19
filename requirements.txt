@@ -2,16 +2,17 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 
-# Oracle DB driver — thin mode (no Oracle Client install needed)
+# Oracle DB driver — thin mode (no Oracle Instant Client needed)
+# Phase 3A: oracledb 4.x required for EXPLAIN PLAN support
 oracledb==4.0.0
 
-# Neo4j graph driver
+# Neo4j graph driver (5.11+ required for vector indexes)
 neo4j==5.19.0
 
 # Google Gemini SDK
 google-generativeai==0.7.2
 
-# Config and validation
+# Config + YAML loader
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
 PyYAML==6.0.1
@@ -27,5 +28,5 @@ pandas==2.2.2
 plotly==5.22.0
 openpyxl==3.1.2
 
-# SQL validation
+# SQL validation — Phase 3A: ValidationAgent uses sqlglot Oracle dialect
 sqlglot==25.5.0
