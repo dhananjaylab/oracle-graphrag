@@ -1,21 +1,23 @@
 """
-frontend/app.py  (v2 — multi-DB + QueryPattern display)
+frontend/app.py  (v2 + Phase 3A)
 
-New in v2:
-  - Database selector dropdown (top of sidebar)
-  - Matched pattern panel: shows reused SQL + the preserved schema Cypher
-  - Schema Cypher expander: shows every Cypher query used for schema discovery
-  - Domain filter in schema explorer
-  - View / non-view badge on schema tables
+New in Phase 3A:
+  - 👍 / 👎 feedback buttons below every result
+  - Corrected SQL text area (optional, shown after thumbs-down)
+  - 🛠 Agent trace tab: validation issues, healing attempts, cost info
+  - Healing indicator badge when SelfHealingAgent recovered the query
+  - skip_explain_plan toggle in sidebar (faster for dev/testing)
 """
 
 import httpx
+import io
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-BACKEND = "http://localhost:8000"
+BACKEND     = "http://localhost:8000"
+_DATE_HINTS = {"DT", "DATE", "MONTH", "MON", "YEAR", "PERIOD", "QTR", "WEEK"}
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -29,20 +31,17 @@ st.markdown("""
 <style>
 [data-testid="stSidebar"] { min-width: 290px; max-width: 330px; }
 [data-testid="metric-container"] {
-    background: #f8f9fa; border-radius: 8px; padding: 8px 12px; }
-.pii-warn {
-    background: #fff3cd; color: #856404; border-radius: 4px;
-    padding: 4px 10px; font-size: 0.82rem; display: inline-block; margin-bottom: 4px; }
-.pattern-badge {
-    background: #d1ecf1; color: #0c5460; border-radius: 4px;
-    padding: 3px 8px; font-size: 0.80rem; display: inline-block; }
-.cross-db-hint {
-    background: #e2e3f3; color: #383d8b; border-radius: 4px;
-    padding: 4px 10px; font-size: 0.82rem; display: inline-block; margin-bottom: 4px; }
+    background:#f8f9fa; border-radius:8px; padding:8px 12px; }
+.pii-warn   { background:#fff3cd; color:#856404; border-radius:4px;
+              padding:4px 10px; font-size:0.82rem; display:inline-block; margin-bottom:4px; }
+.heal-badge { background:#d4edda; color:#155724; border-radius:4px;
+              padding:3px 8px; font-size:0.80rem; display:inline-block; }
+.fail-badge { background:#f8d7da; color:#721c24; border-radius:4px;
+              padding:3px 8px; font-size:0.80rem; display:inline-block; }
+.pat-badge  { background:#d1ecf1; color:#0c5460; border-radius:4px;
+              padding:3px 8px; font-size:0.80rem; display:inline-block; }
 </style>
 """, unsafe_allow_html=True)
-
-_DATE_HINTS = {"DT", "DATE", "MONTH", "MON", "YEAR", "PERIOD", "QTR", "WEEK"}
 
 
 # ── Backend helpers ────────────────────────────────────────────────────────────
@@ -72,16 +71,17 @@ def fetch_examples() -> list[str]:
 
 
 def call_query_api(question: str, db_id: str, history: list[dict],
-                   execute: bool = True) -> dict:
+                   execute: bool = True, skip_explain: bool = False) -> dict:
     try:
         r = httpx.post(
             f"{BACKEND}/api/query",
             json={
-                "question": question,
-                "db_id": db_id,
-                "execute": execute,
-                "max_rows": 1000,
+                "question":             question,
+                "db_id":                db_id,
+                "execute":              execute,
+                "max_rows":             1000,
                 "conversation_history": history,
+                "skip_explain_plan":    skip_explain,
             },
             timeout=120,
         )
@@ -90,6 +90,24 @@ def call_query_api(question: str, db_id: str, history: list[dict],
         return {"error": "Request timed out (120 s). Try a simpler question."}
     except Exception as e:
         return {"error": f"Backend unreachable: {e}"}
+
+
+def call_feedback_api(nl_question: str, db_id: str,
+                      rating: int, corrected_sql: str | None = None) -> dict:
+    try:
+        r = httpx.post(
+            f"{BACKEND}/api/feedback",
+            json={
+                "nl_question":   nl_question,
+                "db_id":         db_id,
+                "rating":        rating,
+                "corrected_sql": corrected_sql or None,
+            },
+            timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 def build_chart(df: pd.DataFrame, chart_type: str) -> go.Figure | None:
@@ -117,9 +135,10 @@ def build_chart(df: pd.DataFrame, chart_type: str) -> go.Figure | None:
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for key, default in [
-    ("question", ""), ("result", None),
-    ("history", []), ("run_query", False),
-    ("preview_only", False), ("selected_db_id", ""),
+    ("question", ""), ("result", None), ("history", []),
+    ("run_query", False), ("preview_only", False),
+    ("selected_db_id", ""), ("feedback_given", False),
+    ("show_correction", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -129,7 +148,7 @@ for key, default in [
 try:
     httpx.get(f"{BACKEND}/api/health", timeout=3).raise_for_status()
 except Exception:
-    st.error("⚠️ Backend not reachable.  Start: `uvicorn backend.main:app --reload`")
+    st.error("⚠️ Backend not reachable.  `uvicorn backend.main:app --reload`")
     st.stop()
 
 
@@ -142,26 +161,32 @@ with st.sidebar:
     st.caption("Banking Analytics · Natural Language Interface")
     st.divider()
 
-    # ── Database selector ──────────────────────────────────────────────────
+    # ── DB selector ────────────────────────────────────────────────────────
     dbs = fetch_databases()
     if dbs:
-        db_labels = {d["id"]: f"{d['name']} ({d['id']})" for d in dbs}
         db_ids    = [d["id"] for d in dbs]
+        db_labels = {d["id"]: f"{d['name']} ({d['id']})" for d in dbs}
         selected  = st.selectbox(
-            "🗄 Active database",
-            options=db_ids,
-            format_func=lambda x: db_labels.get(x, x),
-            key="db_selector",
+            "🗄 Active database", options=db_ids,
+            format_func=lambda x: db_labels.get(x, x), key="db_selector",
         )
         st.session_state.selected_db_id = selected
-
-        # Show description of selected DB
         sel_db = next((d for d in dbs if d["id"] == selected), None)
         if sel_db and sel_db.get("description"):
             st.caption(sel_db["description"][:120])
     else:
-        st.warning("No databases found — run ingestion first.")
+        st.warning("No databases — run ingestion first.")
         st.session_state.selected_db_id = ""
+
+    st.divider()
+
+    # ── Dev options ────────────────────────────────────────────────────────
+    with st.expander("⚙️ Options"):
+        skip_explain = st.toggle(
+            "Skip EXPLAIN PLAN", value=False,
+            help="Faster in dev — skips Oracle cost estimation."
+        )
+        st.session_state.skip_explain = skip_explain
 
     st.divider()
 
@@ -169,59 +194,54 @@ with st.sidebar:
     st.subheader("💡 Try a question")
     for ex in fetch_examples():
         if st.button(ex, key=f"ex_{ex[:28]}"):
-            st.session_state.question  = ex
-            st.session_state.run_query = True
-            st.session_state.history   = []
+            st.session_state.question      = ex
+            st.session_state.run_query     = True
+            st.session_state.history       = []
+            st.session_state.feedback_given= False
             st.rerun()
 
     st.divider()
 
-    # ── Schema explorer (scoped to selected DB) ────────────────────────────
+    # ── Schema explorer ────────────────────────────────────────────────────
     st.subheader("📂 Schema")
-    schema_data = fetch_schema()
+    schema_data   = fetch_schema()
     sel_db_schema = next(
         (d for d in schema_data if d["id"] == st.session_state.selected_db_id), None
     )
     if sel_db_schema:
         tables  = sel_db_schema.get("tables", []) or []
-        domains = list({t.get("domain") for t in tables if t.get("domain")})
-
-        if domains:
-            domain_filter = st.selectbox("Filter by domain", ["All"] + sorted(domains))
-        else:
-            domain_filter = "All"
-
-        shown = [t for t in tables if domain_filter == "All"
-                 or t.get("domain") == domain_filter]
-
-        for tbl in shown[:60]:   # cap at 60 for sidebar performance
+        domains = sorted({t.get("domain") for t in tables if t.get("domain")})
+        domain_filter = st.selectbox("Domain", ["All"] + domains) if domains else "All"
+        shown = [t for t in tables
+                 if domain_filter == "All" or t.get("domain") == domain_filter]
+        for tbl in shown[:60]:
             view_badge = " 👁" if tbl.get("is_view") else ""
-            rc = tbl.get("row_count_approx", 0)
-            rc_str = f"  ~{rc:,} rows" if rc else ""
+            rc         = tbl.get("row_count_approx", 0)
+            rc_str     = f"  ~{rc:,}" if rc else ""
             with st.expander(f"🗄 {tbl['name']}{view_badge}{rc_str}"):
                 if tbl.get("description"):
                     st.caption(tbl["description"][:100])
                 if tbl.get("domain"):
                     st.caption(f"Domain: {tbl['domain']}")
     else:
-        st.info("Run ingestion to populate the schema explorer.\n\n"
-                "`python -m ingestion.ingest_schema`")
+        st.info("Run ingestion:\n`python -m ingestion.ingest_schema`")
 
     st.divider()
 
-    # ── Conversation history ───────────────────────────────────────────────
+    # ── Conversation ───────────────────────────────────────────────────────
     if st.session_state.history:
         st.subheader("🗒 Conversation")
         for turn in st.session_state.history[-6:]:
             icon = "👤" if turn["role"] == "user" else "🤖"
             st.caption(f"{icon} {turn['content'][:72]}…")
-        if st.button("🗑 Clear conversation"):
-            st.session_state.history = []
-            st.session_state.result  = None
+        if st.button("🗑 Clear"):
+            st.session_state.history       = []
+            st.session_state.result        = None
+            st.session_state.feedback_given= False
             st.rerun()
 
     st.divider()
-    st.caption("Data stays on-prem. Only schema metadata sent to Gemini.")
+    st.caption("Data stays on-prem · Only schema metadata → Gemini")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,16 +255,18 @@ with col_input:
     question_input = st.text_input(
         "question", label_visibility="collapsed",
         value=st.session_state.question,
-        placeholder="e.g.  Show total loan disbursements by branch for the current quarter",
+        placeholder="e.g. Show total loan disbursements by branch for the current quarter",
         key="question_input",
     )
 with col_btn:
     ask_clicked = st.button("Ask ↵", type="primary", use_container_width=True)
 
 if ask_clicked and question_input.strip():
-    st.session_state.question  = question_input.strip()
-    st.session_state.run_query = True
-    st.session_state.preview_only = False
+    st.session_state.question       = question_input.strip()
+    st.session_state.run_query      = True
+    st.session_state.preview_only   = False
+    st.session_state.feedback_given = False
+    st.session_state.show_correction= False
 
 # ── Refinement buttons ─────────────────────────────────────────────────────────
 result = st.session_state.result
@@ -260,8 +282,9 @@ if result and not result.get("error") and result.get("rows"):
     ]):
         with r_cols[i]:
             if st.button(label, key=f"ref_{i}"):
-                st.session_state.question  = follow_up
-                st.session_state.run_query = True
+                st.session_state.question       = follow_up
+                st.session_state.run_query      = True
+                st.session_state.feedback_given = False
                 st.rerun()
 
 
@@ -269,17 +292,15 @@ if result and not result.get("error") and result.get("rows"):
 if st.session_state.run_query and st.session_state.question:
     st.session_state.run_query = False
     q = st.session_state.question
-
     with st.spinner(f"Analysing: *{q}*"):
         api_result = call_query_api(
-            question=q,
-            db_id=st.session_state.selected_db_id,
-            history=st.session_state.history,
-            execute=not st.session_state.preview_only,
+            question     = q,
+            db_id        = st.session_state.selected_db_id,
+            history      = st.session_state.history,
+            execute      = not st.session_state.preview_only,
+            skip_explain = st.session_state.get("skip_explain", False),
         )
-
     st.session_state.result = api_result
-
     if not api_result.get("error"):
         st.session_state.history.append({"role": "user",  "content": q})
         if api_result.get("sql"):
@@ -294,46 +315,58 @@ if st.session_state.run_query and st.session_state.question:
 # ══════════════════════════════════════════════════════════════════════════════
 
 result = st.session_state.result
-
 if result is None:
-    st.info("Type a question above or pick an example from the sidebar.")
+    st.info("Type a question above or choose an example from the sidebar.")
     st.stop()
 
 if result.get("error"):
     st.error(f"❌ {result['error']}")
     if result.get("sql"):
-        with st.expander("Generated SQL (debug)"):
+        with st.expander("Last attempted SQL"):
             st.code(result["sql"], language="sql")
+    # Show agent trace even on errors for debugging
+    trace = result.get("agent_trace")
+    if trace and (trace.get("healing_attempts") or trace.get("validation")):
+        with st.expander("🛠 Agent trace (debug)"):
+            st.json(trace)
     st.stop()
 
-# ── Matched QueryPattern banner ────────────────────────────────────────────────
-mp = result.get("matched_pattern")
-if mp:
-    st.markdown(
-        f'<span class="pattern-badge">♻ Reused stored pattern '
-        f'(similarity {mp["similarity"]:.0%} · used {mp["success_count"]}×)</span>',
-        unsafe_allow_html=True,
-    )
-
-# ── Metrics row ────────────────────────────────────────────────────────────────
+# ── Status badges ──────────────────────────────────────────────────────────────
 meta = result.get("meta", {})
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Rows",          meta.get("row_count", 0))
-m2.metric("Exec time",     f"{meta.get('execution_ms', 0)} ms")
-m3.metric("Tables used",   len(meta.get("tables_used", [])))
-m4.metric("Chart",         (meta.get("chart_type") or "none").capitalize())
-m5.metric("DB",            meta.get("db_id", ""))
 
-# ── PII warnings ───────────────────────────────────────────────────────────────
+badge_cols = st.columns([2, 2, 6])
+with badge_cols[0]:
+    if result.get("matched_pattern"):
+        mp = result["matched_pattern"]
+        st.markdown(
+            f'<span class="pat-badge">♻ Pattern reused '
+            f'({mp["similarity"]:.0%} · {mp["success_count"]}×)</span>',
+            unsafe_allow_html=True,
+        )
+with badge_cols[1]:
+    if meta.get("healed"):
+        st.markdown(
+            '<span class="heal-badge">🔧 Auto-recovered by SelfHealingAgent</span>',
+            unsafe_allow_html=True,
+        )
+
+# ── Metrics ────────────────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Rows",        meta.get("row_count", 0))
+m2.metric("Exec time",   f"{meta.get('execution_ms', 0)} ms")
+m3.metric("Tables",      len(meta.get("tables_used", [])))
+m4.metric("Chart",       (meta.get("chart_type") or "none").capitalize())
+m5.metric("DB",          meta.get("db_id", ""))
+
 for warn in result.get("warnings", []):
     st.markdown(f'<span class="pii-warn">🔒 {warn}</span>', unsafe_allow_html=True)
 
 # ── Result tabs ────────────────────────────────────────────────────────────────
 columns = result.get("columns", [])
-rows    = result.get("rows", [])
+rows    = result.get("rows",    [])
 
-tab_table, tab_chart, tab_summary, tab_sql, tab_cypher = st.tabs(
-    ["📊 Table", "📈 Chart", "💬 Summary", "🔍 SQL", "🔗 Cypher"]
+tab_table, tab_chart, tab_summary, tab_sql, tab_cypher, tab_agent = st.tabs(
+    ["📊 Table", "📈 Chart", "💬 Summary", "🔍 SQL", "🔗 Cypher", "🛠 Agent"]
 )
 
 # ── Tab 1: Table ───────────────────────────────────────────────────────────────
@@ -344,10 +377,7 @@ with tab_table:
         df = pd.DataFrame(rows, columns=columns)
         st.dataframe(df, use_container_width=True, height=420)
         st.caption(f"{len(df):,} rows · {len(columns)} columns")
-
-        # Excel download
         try:
-            import io, openpyxl
             buf = io.BytesIO()
             df.to_excel(buf, index=False, engine="openpyxl")
             st.download_button(
@@ -364,7 +394,7 @@ with tab_chart:
     if not rows:
         st.info("No data to chart.")
     elif chart_type == "none":
-        st.info("No chart detected. Try: *'Show the same data grouped by month'*")
+        st.info("No chart auto-detected. Try: *'Show the same data grouped by month'*")
     else:
         df  = pd.DataFrame(rows, columns=columns)
         fig = build_chart(df, chart_type)
@@ -395,40 +425,139 @@ with tab_sql:
     sql = result.get("sql", "")
     if sql:
         st.code(sql, language="sql")
-        st.caption("⚠️ Auto-generated SQL — review before using in critical reports.")
-
-        # Show matched pattern SQL for comparison
+        st.caption("⚠️ Auto-generated — review before using in critical reports.")
+        mp = result.get("matched_pattern")
         if mp and mp.get("sql"):
-            with st.expander("📚 Matched pattern SQL (for reference)"):
+            with st.expander("📚 Matched pattern SQL (reference)"):
                 st.caption(
-                    f"Question: *{mp['nl_question']}*  "
-                    f"| Similarity: {mp['similarity']:.0%}  "
-                    f"| Used {mp['success_count']}×"
+                    f"*{mp['nl_question']}*  |  "
+                    f"Similarity: {mp['similarity']:.0%}  |  "
+                    f"Used: {mp['success_count']}×"
                 )
                 st.code(mp["sql"], language="sql")
     else:
         st.info("No SQL to display.")
 
-# ── Tab 5: Cypher — schema discovery queries (preserved) ──────────────────────
+# ── Tab 5: Cypher ──────────────────────────────────────────────────────────────
 with tab_cypher:
     st.markdown("#### Schema discovery Cypher")
     st.caption(
-        "These are the Neo4j Cypher queries executed to find relevant tables "
-        "and join paths for this question. They are stored alongside each "
-        "QueryPattern for future reuse and debugging."
+        "Neo4j Cypher queries that discovered the relevant tables and join paths. "
+        "Stored in every QueryPattern for future reuse and audit."
     )
-
     schema_cypher = result.get("schema_cypher", "")
     if schema_cypher:
         st.code(schema_cypher, language="cypher")
     else:
-        st.info("No Cypher queries recorded for this request.")
-
-    # Also show matched pattern's stored Cypher if available
+        st.info("No Cypher recorded for this request.")
+    mp = result.get("matched_pattern")
     if mp and mp.get("schema_cypher"):
         with st.expander("📚 Stored Cypher from matched pattern"):
-            st.caption(
-                "This is the Cypher that was used when this pattern was "
-                "originally stored — reused to compare against current results."
-            )
             st.code(mp["schema_cypher"], language="cypher")
+
+# ── Tab 6: Agent trace (Phase 3A) ─────────────────────────────────────────────
+with tab_agent:
+    st.markdown("#### Agent decisions")
+    trace = result.get("agent_trace") or {}
+
+    # ── Validation result ──────────────────────────────────────────────────
+    val = trace.get("validation") or {}
+    if val:
+        st.markdown("**ValidationAgent**")
+        vcols = st.columns(3)
+        vcols[0].metric("Valid",         "✅ Yes" if val.get("valid") else "❌ No")
+        vcols[1].metric("Cost estimate",  str(val.get("cost_estimate") or "N/A"))
+        vcols[2].metric("Cost blocked",   "Yes" if val.get("cost_blocked") else "No")
+
+        issues = val.get("issues", [])
+        if issues:
+            for issue in issues:
+                severity = issue.get("severity", "")
+                icon     = "🔴" if severity == "error" else "🟡"
+                st.markdown(
+                    f"{icon} **{issue.get('code', '')}** — {issue.get('message', '')}"
+                )
+        else:
+            st.success("No validation issues.")
+
+        vwarnings = val.get("warnings", [])
+        if vwarnings:
+            for w in vwarnings:
+                st.warning(w)
+
+    st.divider()
+
+    # ── Healing attempts ───────────────────────────────────────────────────
+    heal_attempts = trace.get("healing_attempts", [])
+    if heal_attempts:
+        st.markdown(f"**SelfHealingAgent** — {len(heal_attempts)} attempt(s)")
+        for attempt in heal_attempts:
+            outcome = attempt.get("outcome", "")
+            icon    = "✅" if outcome == "success" else "❌"
+            label   = f"{icon} Attempt {attempt.get('attempt')} · {attempt.get('error_code')} · {outcome}"
+            with st.expander(label):
+                if attempt.get("error_msg"):
+                    st.error(attempt["error_msg"])
+                if attempt.get("sql_tried"):
+                    st.code(attempt["sql_tried"], language="sql")
+    elif meta.get("healed"):
+        st.success("Query was healed successfully.")
+    else:
+        st.info("No healing was needed — SQL passed validation on first attempt.")
+
+    st.divider()
+    st.caption(
+        f"Total attempts: {trace.get('total_attempts', 1)}  |  "
+        f"Healed: {'Yes' if trace.get('healed') else 'No'}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FEEDBACK  (Phase 3A)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if result and not result.get("error") and result.get("sql"):
+    st.divider()
+    st.markdown("**Was this result correct?**")
+    fb_cols = st.columns([1, 1, 8])
+
+    with fb_cols[0]:
+        if st.button("👍 Yes", key="thumbs_up",
+                     disabled=st.session_state.feedback_given):
+            fb = call_feedback_api(
+                nl_question  = st.session_state.question,
+                db_id        = st.session_state.selected_db_id,
+                rating       = 5,
+            )
+            st.session_state.feedback_given = True
+            st.success("Feedback recorded — pattern weight increased.")
+            st.rerun()
+
+    with fb_cols[1]:
+        if st.button("👎 No", key="thumbs_down",
+                     disabled=st.session_state.feedback_given):
+            st.session_state.show_correction = True
+            st.session_state.feedback_given  = False   # allow submit after correction
+
+    if st.session_state.get("show_correction") and not st.session_state.feedback_given:
+        corrected = st.text_area(
+            "Optional: paste the correct SQL (helps future queries)",
+            height=100, key="corrected_sql_input",
+        )
+        if st.button("Submit feedback", type="primary", key="submit_feedback"):
+            fb = call_feedback_api(
+                nl_question  = st.session_state.question,
+                db_id        = st.session_state.selected_db_id,
+                rating       = 1,
+                corrected_sql= corrected.strip() if corrected.strip() else None,
+            )
+            st.session_state.feedback_given  = True
+            st.session_state.show_correction = False
+            if corrected.strip():
+                st.warning("Feedback recorded — pattern de-weighted and SQL corrected.")
+            else:
+                st.warning("Feedback recorded — pattern de-weighted.")
+            st.rerun()
+
+    if st.session_state.feedback_given:
+        st.caption("✓ Feedback submitted")
