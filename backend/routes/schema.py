@@ -1,23 +1,21 @@
 """
-backend/routes/schema.py  (v2 + Phase 3A feedback endpoint)
+backend/routes/schema.py  (v2 + Phase 3A feedback + Phase 3B MCP routing)
 
-New in Phase 3A:
-  POST /api/feedback  — thumbs up/down → updates QueryPattern.success_count
-                        optional corrected_sql → replaces stored SQL
+Phase 3B changes:
+  /api/schema    → reads from neo4j_mcp.get_schema_summary()
+  /api/feedback  → writes through neo4j_mcp.record_feedback()
+
+Both fall back to direct neo4j_service calls when the MCP server
+is unavailable, ensuring the API stays live during MCP restarts.
 """
 
 from fastapi import APIRouter
 
 from backend.db_manager import db_manager
+from backend.mcp_client import neo4j_mcp
 from backend.models import (
     SchemaResponse, DatabaseSummary, DomainSummary, TableSummary,
     FeedbackRequest,
-)
-from backend.services.neo4j_service import (
-    get_schema_summary,
-    increment_pattern_success,
-    decrement_pattern_success,
-    update_pattern_sql,
 )
 
 router = APIRouter()
@@ -37,30 +35,47 @@ EXAMPLE_QUESTIONS = [
 
 @router.get("/health")
 async def health():
+    """
+    Liveness check. Reports Oracle DB config status and MCP server reachability.
+    """
     dbs = [
         {"id": d.id, "name": d.name, "configured": d.is_configured}
         for d in db_manager.databases
     ]
-    return {"status": "ok", "databases": dbs}
+
+    # Probe both MCP servers (non-blocking — failures don't break health)
+    from backend.mcp_client import oracle_mcp
+    oracle_mcp_ok = await oracle_mcp.ping()
+    neo4j_mcp_ok  = await neo4j_mcp.ping()
+
+    return {
+        "status":     "ok",
+        "databases":  dbs,
+        "mcp_servers": {
+            "oracle": "up" if oracle_mcp_ok else "down (fallback active)",
+            "neo4j":  "up" if neo4j_mcp_ok  else "down (fallback active)",
+        },
+    }
 
 
-# ── Schema explorer ────────────────────────────────────────────────────────────
+# ── Schema ─────────────────────────────────────────────────────────────────────
 
 @router.get("/schema", response_model=SchemaResponse)
 async def schema():
     """
     Return all databases with enriched tables and business domains.
-    Reads from Neo4j — no Oracle queries at UI load time.
+    Reads from Neo4j via MCP — no Oracle queries at UI load time.
+    Falls back to direct neo4j_service on MCP failure.
     """
-    raw          = await get_schema_summary()
+    raw          = await neo4j_mcp.get_schema_summary()
     db_summaries: list[DatabaseSummary] = []
 
     for db_raw in raw.get("databases", []):
         db_id   = db_raw.get("id", "")
-        tables  = db_raw.get("tables", []) or []
+        tables  = db_raw.get("tables",  []) or []
         domains = db_raw.get("domains", []) or []
 
-        # Deduplicate tables (Cypher collect may return nulls)
+        # Deduplicate tables (Cypher collect() may produce nulls)
         seen: set[str] = set()
         table_summaries: list[TableSummary] = []
         for t in tables:
@@ -105,6 +120,8 @@ async def schema():
     return SchemaResponse(databases=db_summaries, total_databases=len(db_summaries))
 
 
+# ── Databases list ─────────────────────────────────────────────────────────────
+
 @router.get("/databases")
 async def databases():
     """Quick list of registered databases for the UI DB-selector dropdown."""
@@ -121,42 +138,55 @@ async def databases():
     }
 
 
+# ── Examples ───────────────────────────────────────────────────────────────────
+
 @router.get("/examples")
 async def examples():
     return {"examples": EXAMPLE_QUESTIONS}
 
 
-# ── Feedback (Phase 3A) ────────────────────────────────────────────────────────
+# ── Feedback (Phase 3A + 3B MCP routing) ──────────────────────────────────────
 
 @router.post("/feedback")
 async def feedback(request: FeedbackRequest):
     """
     Record user feedback on a generated SQL result.
 
-    rating ≥ 4  (thumbs up)   → increment pattern.success_count
-    rating < 4  (thumbs down) → decrement pattern.success_count
-    corrected_sql provided    → replace stored SQL (also bumps count by +2)
+    Phase 3B: routed through Neo4j MCP server (neo4j_mcp.record_feedback).
+    Falls back to direct neo4j_service calls on MCP failure.
 
-    Effect: patterns with higher success_count rank higher in future
-    semantic searches and are injected as more-trusted few-shot examples.
+    rating ≥ 4  (thumbs up)   → action="increment"  success_count + 1
+    rating < 4  (thumbs down) → action="decrement"  success_count - 1
+    corrected_sql provided    → action="correct"     replace stored SQL + 2
     """
-    updated = False
+    updated      = False
+    corrected    = (request.corrected_sql or "").strip()
 
     if request.rating >= 4:
-        updated = await increment_pattern_success(request.nl_question, request.db_id)
+        updated = await neo4j_mcp.record_feedback(
+            nl_question = request.nl_question,
+            database_id = request.db_id,
+            action      = "increment",
+        )
     else:
-        updated = await decrement_pattern_success(request.nl_question, request.db_id)
+        updated = await neo4j_mcp.record_feedback(
+            nl_question = request.nl_question,
+            database_id = request.db_id,
+            action      = "decrement",
+        )
 
-    if request.corrected_sql and request.corrected_sql.strip():
-        await update_pattern_sql(
-            request.nl_question,
-            request.db_id,
-            request.corrected_sql.strip(),
+    # Correction is additive — apply on top of any rating
+    if corrected:
+        await neo4j_mcp.record_feedback(
+            nl_question   = request.nl_question,
+            database_id   = request.db_id,
+            action        = "correct",
+            corrected_sql = corrected,
         )
 
     return {
-        "status":   "recorded" if updated else "pattern_not_found",
-        "rating":   request.rating,
-        "question": request.nl_question[:80],
-        "has_correction": bool(request.corrected_sql),
+        "status":          "recorded" if updated else "pattern_not_found",
+        "rating":          request.rating,
+        "question":        request.nl_question[:80],
+        "has_correction":  bool(corrected),
     }
