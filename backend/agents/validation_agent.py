@@ -182,13 +182,6 @@ class ValidationAgent:
             parsed = sqlglot.parse(sql, dialect="oracle", error_level=sqlglot.ErrorLevel.RAISE)
             if not parsed or parsed[0] is None:
                 return {"valid": False, "error": "SQL parsed to empty AST"}
-            
-            # Oracle requires a FROM clause for every SELECT statement
-            ast = parsed[0]
-            for select in ast.find_all(sqlglot.exp.Select):
-                if not select.args.get("from"):
-                    return {"valid": False, "error": "Missing FROM clause in SELECT statement"}
-
             return {"valid": True}
         except sqlglot.errors.ParseError as exc:
             # Extract first error with optional line number
