@@ -173,7 +173,7 @@ class TableSummary(BaseModel):
 
 
 class DatabaseSummary(BaseModel):
-    id:          str
+    id:          Optional[str] = None
     name:        str
     description: str
     table_count: int

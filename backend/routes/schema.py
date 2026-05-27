@@ -104,7 +104,7 @@ async def schema():
 
         try:
             cfg  = db_manager.get_config(db_id)
-            desc = cfg.description
+            desc = cfg.description or ""
         except Exception:
             desc = db_raw.get("description") or ""
 
