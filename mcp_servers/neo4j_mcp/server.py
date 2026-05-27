@@ -37,34 +37,37 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-from mcp.server.fastmcp import FastMCP
+# from mcp.server.fastmcp import FastMCP
+
+from fastmcp import FastMCP
 
 import backend.services.neo4j_service as neo4j_svc
 
 mcp = FastMCP(
     name        = "neo4j-mcp-server",
-    description = (
-        "Banking schema graph gateway — exposes vector-based schema discovery, "
-        "FK join-path traversal, cross-database link hints, and the "
-        "self-improving QueryPattern store/retrieve loop."
-    ),
+    # description = (
+    #     "Banking schema graph gateway — exposes vector-based schema discovery, "
+    #     "FK join-path traversal, cross-database link hints, and the "
+    #     "self-improving QueryPattern store/retrieve loop."
+    # ),
 )
 
 
 # ── asyncio helper (FastMCP tools are sync; neo4j_svc is async) ───────────────
 
-def _run(coro):
-    """Run an async coroutine from a synchronous FastMCP tool handler."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+# def _run(coro):
+#     """Run an async coroutine from a synchronous FastMCP tool handler."""
+#     try:
+#         loop = asyncio.get_running_loop()
+#     except RuntimeError:
+#         # No running loop — safe to use asyncio.run()
+#         return asyncio.run(coro)
+    
+#     # If we get here, a loop is running in this thread
+#     # This shouldn't happen with FastMCP, but handle it just in case
+#     import concurrent.futures
+#     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+#         return pool.submit(asyncio.run, coro).result()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,7 +75,7 @@ def _run(coro):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def semantic_search(
+async def semantic_search(
     embedding_json: str,
     database_id:    str,
     top_k:          int = 12,
@@ -102,11 +105,11 @@ def semantic_search(
         }
     """
     embedding: list[float] = json.loads(embedding_json)
-    result = _run(neo4j_svc.semantic_schema_search(
+    result = await neo4j_svc.semantic_schema_search(
         query_embedding=embedding,
         database_id=database_id,
         top_k=top_k,
-    ))
+    )
     return json.dumps(result, default=str)
 
 
@@ -115,7 +118,7 @@ def semantic_search(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_table_details(table_names_json: str, database_id: str) -> str:
+async def get_table_details(table_names_json: str, database_id: str) -> str:
     """
     Retrieve full column metadata for a list of tables from the graph.
 
@@ -154,7 +157,7 @@ def get_table_details(table_names_json: str, database_id: str) -> str:
         ]
     """
     table_names: list[str] = json.loads(table_names_json)
-    result = _run(neo4j_svc.get_table_details(table_names, database_id))
+    result = await neo4j_svc.get_table_details(table_names, database_id)
     return json.dumps(result, default=str)
 
 
@@ -163,7 +166,7 @@ def get_table_details(table_names_json: str, database_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_join_path(table1: str, table2: str, database_id: str) -> str:
+async def get_join_path(table1: str, table2: str, database_id: str) -> str:
     """
     Find the shortest FK-based join path between two tables using
     Neo4j shortestPath over (:Table)-[:FK_TO*1..5]->(:Table) edges.
@@ -182,7 +185,7 @@ def get_join_path(table1: str, table2: str, database_id: str) -> str:
           }
         ]
     """
-    result = _run(neo4j_svc.get_join_path(table1, table2, database_id))
+    result = await neo4j_svc.get_join_path(table1, table2, database_id)
     return json.dumps(result, default=str)
 
 
@@ -191,7 +194,7 @@ def get_join_path(table1: str, table2: str, database_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_cross_db_hints(table_names_json: str, database_id: str) -> str:
+async def get_cross_db_hints(table_names_json: str, database_id: str) -> str:
     """
     Return cross-database CROSS_DB_JOIN edges for the candidate tables.
 
@@ -216,7 +219,7 @@ def get_cross_db_hints(table_names_json: str, database_id: str) -> str:
         ]
     """
     table_names: list[str] = json.loads(table_names_json)
-    result = _run(neo4j_svc.get_cross_db_hints(table_names, database_id))
+    result = await neo4j_svc.get_cross_db_hints(table_names, database_id)
     return json.dumps(result, default=str)
 
 
@@ -225,7 +228,7 @@ def get_cross_db_hints(table_names_json: str, database_id: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def search_patterns(
+async def search_patterns(
     embedding_json: str,
     database_id:    str,
     top_k:          int   = 3,
@@ -257,12 +260,12 @@ def search_patterns(
         ]
     """
     embedding: list[float] = json.loads(embedding_json)
-    result = _run(neo4j_svc.search_similar_patterns(
+    result = await neo4j_svc.search_similar_patterns(
         query_embedding=embedding,
         database_id=database_id,
         top_k=top_k,
         min_similarity=min_similarity,
-    ))
+    )
     return json.dumps(result, default=str)
 
 
@@ -271,7 +274,7 @@ def search_patterns(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def store_pattern(
+async def store_pattern(
     database_id:    str,
     nl_question:    str,
     sql:            str,
@@ -304,7 +307,7 @@ def store_pattern(
     try:
         tables_used: list[str]  = json.loads(tables_used_json)
         embedding:   list[float] = json.loads(embedding_json)
-        _run(neo4j_svc.store_query_pattern(
+        await neo4j_svc.store_query_pattern(
             database_id  = database_id,
             nl_question  = nl_question,
             sql          = sql,
@@ -312,7 +315,7 @@ def store_pattern(
             tables_used  = tables_used,
             execution_ms = execution_ms,
             embedding    = embedding,
-        ))
+        )
         return json.dumps({"stored": True})
     except Exception as exc:
         return json.dumps({"stored": False, "error": str(exc)})
@@ -323,7 +326,7 @@ def store_pattern(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_schema_summary() -> str:
+async def get_schema_summary() -> str:
     """
     Return all databases with their enriched tables and business domains.
 
@@ -346,7 +349,7 @@ def get_schema_summary() -> str:
           ]
         }
     """
-    result = _run(neo4j_svc.get_schema_summary())
+    result = await neo4j_svc.get_schema_summary()
     return json.dumps(result, default=str)
 
 
@@ -355,7 +358,7 @@ def get_schema_summary() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def record_feedback(
+async def record_feedback(
     nl_question:   str,
     database_id:   str,
     action:        str,
@@ -384,13 +387,13 @@ def record_feedback(
     try:
         updated = False
         if action == "increment":
-            updated = _run(neo4j_svc.increment_pattern_success(nl_question, database_id))
+            updated = await neo4j_svc.increment_pattern_success(nl_question, database_id)
         elif action == "decrement":
-            updated = _run(neo4j_svc.decrement_pattern_success(nl_question, database_id))
+            updated = await neo4j_svc.decrement_pattern_success(nl_question, database_id)
         elif action == "correct" and corrected_sql.strip():
-            updated = _run(neo4j_svc.update_pattern_sql(
+            updated = await neo4j_svc.update_pattern_sql(
                 nl_question, database_id, corrected_sql.strip()
-            ))
+            )
         return json.dumps({"updated": updated, "action": action})
     except Exception as exc:
         return json.dumps({"updated": False, "error": str(exc)})
