@@ -1,4 +1,4 @@
-"""backend/models.py  (v2 + Phase 3A agents)"""
+"""backend/models.py  (v2 + Phase 3A + 3B + 3C)"""
 
 from pydantic import BaseModel
 from typing import Any, Optional
@@ -7,44 +7,57 @@ from typing import Any, Optional
 # ── Conversation ───────────────────────────────────────────────────────────────
 
 class ConversationTurn(BaseModel):
-    role:    str    # "user" | "model"
+    role:    str
     content: str
 
 
-# ── Agent trace models ─────────────────────────────────────────────────────────
+# ── Conversation context for supervisor (Phase 3C) ────────────────────────────
+
+class ConversationContextEntry(BaseModel):
+    """One compressed turn for the supervisor's summarised context."""
+    question:     str
+    dbs_queried:  list[str]       = []
+    tables_used:  list[str]       = []
+    row_count:    int             = 0
+    key_metrics:  dict[str, Any]  = {}
+    partial:      bool            = False
+    missing_info: str             = ""
+
+
+# ── Agent trace (Phase 3A) ─────────────────────────────────────────────────────
 
 class ValidationIssue(BaseModel):
-    severity: str          # "error" | "warning"
-    code:     str          # "ORA-00942", "sqlglot_syntax", "cartesian_join", …
+    severity: str
+    code:     str
     message:  str
     line:     Optional[int] = None
 
 
 class ValidationResult(BaseModel):
-    valid:          bool
-    sql:            str
-    issues:         list[ValidationIssue] = []
-    warnings:       list[str]             = []
-    cost_estimate:  Optional[int]         = None
-    cost_blocked:   bool                  = False
+    valid:         bool
+    sql:           str
+    issues:        list[ValidationIssue] = []
+    warnings:      list[str]             = []
+    cost_estimate: Optional[int]         = None
+    cost_blocked:  bool                  = False
 
 
 class HealingAttemptModel(BaseModel):
     attempt:    int
     error_code: str
     sql_tried:  str
-    outcome:    str    # "validation_failed" | "execution_failed" | "success"
-    error_msg:  str    = ""
+    outcome:    str
+    error_msg:  str = ""
 
 
 class AgentTrace(BaseModel):
-    validation:      Optional[ValidationResult]      = None
-    healing_attempts: list[HealingAttemptModel]      = []
-    healed:          bool                            = False
-    total_attempts:  int                             = 0
+    validation:       Optional[ValidationResult]  = None
+    healing_attempts: list[HealingAttemptModel]   = []
+    healed:           bool                        = False
+    total_attempts:   int                         = 0
 
 
-# ── Request / Response ─────────────────────────────────────────────────────────
+# ── Linear pipeline request / response (Phase 3A/3B) ──────────────────────────
 
 class QueryRequest(BaseModel):
     question:             str
@@ -52,14 +65,14 @@ class QueryRequest(BaseModel):
     execute:              bool                   = True
     max_rows:             int                    = 1000
     conversation_history: list[ConversationTurn] = []
-    skip_explain_plan:    bool                   = False  # skip EXPLAIN PLAN (faster in dev)
+    skip_explain_plan:    bool                   = False
 
 
 class MatchedPattern(BaseModel):
-    nl_question:  str
-    sql:          str
+    nl_question:   str
+    sql:           str
     schema_cypher: str
-    similarity:   float
+    similarity:    float
     success_count: int
 
 
@@ -71,23 +84,76 @@ class QueryMeta(BaseModel):
     execution_ms:    int
     chart_type:      str
     pattern_matched: bool = False
-    healed:          bool = False   # True if SelfHealingAgent recovered the query
+    healed:          bool = False
 
 
 class QueryResponse(BaseModel):
-    question:       str
-    db_id:          str
-    sql:            str
-    columns:        list[str]         = []
-    rows:           list[list[Any]]   = []
-    summary:        str               = ""
-    chart_type:     str               = "none"
-    warnings:       list[str]         = []
-    matched_pattern: Optional[MatchedPattern]  = None
-    schema_cypher:  str               = ""
-    agent_trace:    Optional[AgentTrace]       = None   # full agent decision log
-    meta:           QueryMeta
-    error:          Optional[str]     = None
+    question:        str
+    db_id:           str
+    sql:             str
+    columns:         list[str]         = []
+    rows:            list[list[Any]]   = []
+    summary:         str               = ""
+    chart_type:      str               = "none"
+    warnings:        list[str]         = []
+    matched_pattern: Optional[MatchedPattern] = None
+    schema_cypher:   str               = ""
+    agent_trace:     Optional[AgentTrace]     = None
+    meta:            QueryMeta
+    error:           Optional[str]     = None
+
+
+# ── Supervisor request / response (Phase 3C) ───────────────────────────────────
+
+class SupervisorRequest(BaseModel):
+    """
+    POST /api/supervisor
+
+    conversation_history: compressed turns from the current session —
+    each entry is a ConversationContextEntry (aggregate stats only, no raw rows).
+    """
+    question:             str
+    max_rows:             int                              = 1000
+    conversation_history: list[ConversationContextEntry]  = []
+
+
+class DBResult(BaseModel):
+    """Per-database result from one supervisor execute_query call."""
+    db_id:         str
+    sql:           str
+    columns:       list[str]         = []
+    rows:          list[list[Any]]   = []
+    row_count:     int               = 0
+    summary_stats: dict[str, Any]    = {}
+    tables_used:   list[str]         = []
+    execution_ms:  int               = 0
+
+
+class ToolCallRecord(BaseModel):
+    """Single tool call recorded in the supervisor trace."""
+    tool_name:  str
+    args:       dict[str, Any]
+    result:     dict[str, Any]
+    elapsed_ms: int
+    iteration:  int
+
+
+class SupervisorResult(BaseModel):
+    """
+    Final payload from the supervisor — delivered as the 'finish' SSE event.
+    Also returned synchronously when the UI polls after streaming.
+    """
+    summary:          str
+    db_results:       list[DBResult]       = []
+    dbs_queried:      list[str]            = []
+    tables_used:      list[str]            = []
+    tool_calls:       list[ToolCallRecord] = []
+    partial:          bool                 = False
+    missing_info:     str                  = ""
+    merge_strategy:   str                  = "single_db"
+    total_iterations: int                  = 0
+    total_ms:         int                  = 0
+    error:            str                  = ""
 
 
 # ── Schema / DB summary ────────────────────────────────────────────────────────
@@ -98,16 +164,16 @@ class DomainSummary(BaseModel):
 
 
 class TableSummary(BaseModel):
-    name:            str
-    description:     str
-    column_count:    int
-    is_view:         bool = False
-    row_count_approx: int = 0
-    domain:          str  = ""
+    name:             str
+    description:      str
+    column_count:     int
+    is_view:          bool = False
+    row_count_approx: int  = 0
+    domain:           str  = ""
 
 
 class DatabaseSummary(BaseModel):
-    id:          str
+    id:          Optional[str] = None
     name:        str
     description: str
     table_count: int
@@ -125,5 +191,5 @@ class SchemaResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     nl_question:   str
     db_id:         str
-    rating:        int            # 1 = thumbs down, 5 = thumbs up
-    corrected_sql: Optional[str] = None   # user-provided correct SQL (optional)
+    rating:        int
+    corrected_sql: Optional[str] = None

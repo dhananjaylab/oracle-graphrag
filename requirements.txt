@@ -1,41 +1,39 @@
-# ── Web framework ─────────────────────────────────────────────────────────────
+# ── Web framework ──────────────────────────────────────────────────────────────
 fastapi>=0.115.0
 uvicorn[standard]==0.29.0
 
-# ── Oracle DB driver — thin mode, no Oracle Instant Client required ────────────
-# Phase 3A: 4.x required for EXPLAIN PLAN and current_schema support
+# ── Oracle DB driver — thin mode, no Oracle Instant Client ─────────────────────
 oracledb==4.0.0
 
-# ── Neo4j graph driver — 5.11+ required for vector index support ───────────────
+# ── Neo4j graph driver — 5.11+ for vector index support ───────────────────────
 neo4j==5.19.0
 
-# ── Google Gemini SDK ──────────────────────────────────────────────────────────
+# ── Google Gemini SDK — function calling used by Phase 3C supervisor ──────────
 google-generativeai==0.7.2
 
-# ── Phase 3B: MCP (Model Context Protocol) ────────────────────────────────────
-# FastMCP server + SSE client used by both MCP servers and the backend client.
-# Pinned to 1.x — Phase 3C will evaluate 2.x when stable.
+# ── Phase 3B+3C: MCP SDK ──────────────────────────────────────────────────────
+# fastmcp is the standalone high-level FastMCP server package.
+# mcp[cli] provides the low-level client (ClientSession, sse_client) used in
+# backend/mcp_client/base.py for persistent SSE connections.
+fastmcp>=0.2.0
 mcp[cli]>=1.0.0,<2.0.0
 
-# ── Config + YAML ─────────────────────────────────────────────────────────────
+# ── Config + YAML ──────────────────────────────────────────────────────────────
 pydantic-settings>=2.6.1
 python-dotenv==1.0.1
 PyYAML==6.0.1
 
-# ── HTTP client — Streamlit → FastAPI, MCP client SSE transport ───────────────
+# ── HTTP client — Streamlit → FastAPI, MCP SSE transport, Phase 3C streaming ──
 httpx>=0.28.1
 httpx-sse==0.4.0
 
 # ── Frontend ───────────────────────────────────────────────────────────────────
 streamlit==1.35.0
 
-# ── Data handling + output ────────────────────────────────────────────────────
+# ── Data handling + output ─────────────────────────────────────────────────────
 pandas==2.2.2
 plotly==5.22.0
 openpyxl==3.1.2
 
 # ── Phase 3A: SQL validation — sqlglot Oracle dialect ─────────────────────────
 sqlglot==25.5.0
-
-# ── Phase 3C: FastMCP client ──────────────────────────────────────────────────
-fastmcp<=3.0.0
