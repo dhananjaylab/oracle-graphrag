@@ -37,9 +37,7 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-# fastmcp>=0.2.0from mcp.server.fastmcp import FastMCP
-
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 
 from backend.db_manager import db_manager
 from backend.services import oracle_service
@@ -47,12 +45,12 @@ from backend.services import oracle_service
 # ── Server instance ────────────────────────────────────────────────────────────
 mcp = FastMCP(
     name        = "oracle-mcp-server",
-    # description = (
-    #     "Banking Oracle DB gateway — exposes read-only query execution, "
-    #     "EXPLAIN PLAN cost estimation, and enriched schema metadata. "
-    #     "All tools are data-privacy safe: no raw row data is returned "
-    #     "beyond what the authenticated user explicitly queries."
-    # ),
+    description = (
+        "Banking Oracle DB gateway — exposes read-only query execution, "
+        "EXPLAIN PLAN cost estimation, and enriched schema metadata. "
+        "All tools are data-privacy safe: no raw row data is returned "
+        "beyond what the authenticated user explicitly queries."
+    ),
 )
 
 
