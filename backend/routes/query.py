@@ -88,29 +88,11 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
         )
 
     # ── Step 4: GraphRAG semantic search (via Neo4j MCP) ───────────────────
-    # search_results: dict = await neo4j_mcp.semantic_search(
-    #     query_embedding = query_embedding,
-    #     database_id     = db_id,
-    #     top_k           = 12,
-    # )
-    # cypher_log.append(search_results.get("cypher_used", ""))
-
-    # candidate_tables: list[str] = list(
-    #     {r["table_name"] for r in search_results.get("tables",  [])}
-    #     | {r["table_name"] for r in search_results.get("columns", [])}
-    # )
-
     search_results: dict = await neo4j_mcp.semantic_search(
-    query_embedding = query_embedding,
-    database_id     = db_id,
-    top_k           = 12,
+        query_embedding = query_embedding,
+        database_id     = db_id,
+        top_k           = 12,
     )
-
-    # Handle error or non-dict responses from MCP
-    if isinstance(search_results, str):
-        warnings.append(f"Schema search warning: {search_results}")
-        search_results = {"tables": [], "columns": [], "cypher_used": ""}
-
     cypher_log.append(search_results.get("cypher_used", ""))
 
     candidate_tables: list[str] = list(
