@@ -113,6 +113,14 @@ async def _dispatch_neo4j(tool_name: str, args: dict) -> dict:
         )
         return {"join_path": path}
 
+    if tool_name == "get_join_paths_batch":
+        tables = _parse_json_list(args["table_names_json"])
+        paths  = await neo4j_mcp.get_join_paths_batch(
+            table_names = tables,
+            database_id = args["database_id"],
+        )
+        return {"join_paths": paths}
+
     if tool_name == "get_cross_db_hints":
         tables = _parse_json_list(args["table_names_json"])
         hints  = await neo4j_mcp.get_cross_db_hints(
