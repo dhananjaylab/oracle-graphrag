@@ -1,4 +1,11 @@
-"""backend/models.py  (v2 + Phase 3A + 3B + 3C)"""
+"""backend/models.py  (v2 + Phase 3A + 3B + 3C + Phase 4B)
+
+Phase 4B additions to QueryMeta:
+  cache_hit     — True if any cache (embedding / schema / result) was used
+  cache_source  — which cache(s) were hit: "embedding", "schema", "result",
+                  "embedding+schema", "result", etc.
+  pipeline_ms   — total wall-clock time of the full pipeline in ms
+"""
 
 from pydantic import BaseModel
 from typing import Any, Optional
@@ -14,7 +21,6 @@ class ConversationTurn(BaseModel):
 # ── Conversation context for supervisor (Phase 3C) ────────────────────────────
 
 class ConversationContextEntry(BaseModel):
-    """One compressed turn for the supervisor's summarised context."""
     question:     str
     dbs_queried:  list[str]       = []
     tables_used:  list[str]       = []
@@ -57,7 +63,7 @@ class AgentTrace(BaseModel):
     total_attempts:   int                         = 0
 
 
-# ── Linear pipeline request / response (Phase 3A/3B) ──────────────────────────
+# ── Linear pipeline request / response (Phase 3A/3B + Phase 4B) ───────────────
 
 class QueryRequest(BaseModel):
     question:             str
@@ -85,6 +91,10 @@ class QueryMeta(BaseModel):
     chart_type:      str
     pattern_matched: bool = False
     healed:          bool = False
+    # Phase 4B — cache observability
+    cache_hit:       bool = False
+    cache_source:    str  = ""   # e.g. "embedding+schema", "result", ""
+    pipeline_ms:     int  = 0    # total wall-clock time for the full pipeline
 
 
 class QueryResponse(BaseModel):
@@ -106,19 +116,12 @@ class QueryResponse(BaseModel):
 # ── Supervisor request / response (Phase 3C) ───────────────────────────────────
 
 class SupervisorRequest(BaseModel):
-    """
-    POST /api/supervisor
-
-    conversation_history: compressed turns from the current session —
-    each entry is a ConversationContextEntry (aggregate stats only, no raw rows).
-    """
     question:             str
     max_rows:             int                              = 1000
     conversation_history: list[ConversationContextEntry]  = []
 
 
 class DBResult(BaseModel):
-    """Per-database result from one supervisor execute_query call."""
     db_id:         str
     sql:           str
     columns:       list[str]         = []
@@ -130,7 +133,6 @@ class DBResult(BaseModel):
 
 
 class ToolCallRecord(BaseModel):
-    """Single tool call recorded in the supervisor trace."""
     tool_name:  str
     args:       dict[str, Any]
     result:     dict[str, Any]
@@ -139,10 +141,6 @@ class ToolCallRecord(BaseModel):
 
 
 class SupervisorResult(BaseModel):
-    """
-    Final payload from the supervisor — delivered as the 'finish' SSE event.
-    Also returned synchronously when the UI polls after streaming.
-    """
     summary:          str
     db_results:       list[DBResult]       = []
     dbs_queried:      list[str]            = []

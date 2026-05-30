@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 
-from backend.mcp_client.base import MCPClientSession
+from backend.mcp_client.pool import MCPConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,11 @@ class OracleMCPClient:
     """
 
     def __init__(self, server_url: str = ORACLE_MCP_URL) -> None:
-        self._session = MCPClientSession(server_url, name="oracle")
+        self._session = MCPConnectionPool(server_url, name="oracle")
+
+    @property
+    def pool_stats(self) -> dict:
+        return self._session.stats
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

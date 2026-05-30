@@ -151,7 +151,16 @@ class MCPClientSession:
     def _parse(text: str) -> Any:
         """Best-effort JSON parse; return raw string on failure."""
         try:
-            return json.loads(text)
+            val = json.loads(text)
+            if isinstance(val, str):
+                val_stripped = val.strip()
+                if (val_stripped.startswith("{") and val_stripped.endswith("}")) or \
+                   (val_stripped.startswith("[") and val_stripped.endswith("]")):
+                    try:
+                        return json.loads(val_stripped)
+                    except Exception:
+                        pass
+            return val
         except (json.JSONDecodeError, TypeError):
             return text
 

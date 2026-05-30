@@ -1,12 +1,12 @@
 """
-backend/services/neo4j_service.py  (v2 + Phase 3A feedback)
+backend/services/neo4j_service.py  (v2 + Phase 3A feedback + Phase 4A batch joins)
 
-New in Phase 3A:
-  increment_pattern_success()  — thumbs up → raise pattern weight
-  decrement_pattern_success()  — thumbs down → lower pattern weight
-  update_pattern_sql()         — user supplies corrected SQL → replace stored SQL
+Phase 4A additions:
+  get_join_paths_batch()  — single Cypher query returning shortest FK paths
+                            for all pairs of candidate tables at once.
+                            Replaces N-1 sequential get_join_path calls.
 
-All other functions unchanged from v2.
+All other functions unchanged from v2/Phase 3A.
 """
 
 import uuid
@@ -142,6 +142,7 @@ async def get_table_details(table_names: list[str], database_id: str) -> list[di
 
 
 async def get_join_path(table1: str, table2: str, database_id: str) -> list[dict]:
+    """Find shortest FK path between two tables. Kept for single-pair lookups."""
     cypher = """
         MATCH path = shortestPath(
             (t1:Table {name: $t1, database_id: $db_id})
@@ -156,6 +157,49 @@ async def get_join_path(table1: str, table2: str, database_id: str) -> list[dict
     driver = get_driver()
     async with driver.session() as session:
         result = await session.run(cypher, t1=table1, t2=table2, db_id=database_id)
+        return await result.data()
+
+
+async def get_join_paths_batch(table_names: list[str], database_id: str) -> list[dict]:
+    """
+    Phase 4A — single Cypher query that finds shortest FK paths between
+    all pairs of candidate tables.
+
+    Returns a flat list of path objects:
+        [
+          {
+            "from_table":      "LOAN_MASTER",
+            "to_table":        "BRANCH_MASTER",
+            "table_sequence":  ["LOAN_MASTER", "BRANCH_MASTER"],
+            "join_conditions": [{"from_col": "BRCH_CD", "to_col": "BRCH_CD"}],
+          },
+          ...
+        ]
+
+    Uses a bi-directional undirected match (FK_TO without direction)
+    so reverse joins (child→parent) are also found.
+    """
+    if len(table_names) < 2:
+        return []
+
+    cypher = """
+        MATCH (t:Table)
+        WHERE t.name IN $tables AND t.database_id = $db_id
+        WITH collect(t) AS tbl_nodes
+        UNWIND tbl_nodes AS t1
+        UNWIND tbl_nodes AS t2
+        WITH t1, t2
+        WHERE t1.name < t2.name
+        MATCH path = shortestPath((t1)-[:FK_TO*1..5]-(t2))
+        RETURN t1.name AS from_table,
+               t2.name AS to_table,
+               [n IN nodes(path) | n.name]                                 AS table_sequence,
+               [r IN relationships(path) | {from_col: r.from_col, to_col: r.to_col}]
+               AS join_conditions
+    """
+    driver = get_driver()
+    async with driver.session() as session:
+        result = await session.run(cypher, tables=table_names, db_id=database_id)
         return await result.data()
 
 
@@ -198,7 +242,7 @@ async def get_schema_summary() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QUERY PATTERN STORAGE — preserve SQL + Cypher after successful execution
+# QUERY PATTERN STORAGE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def store_query_pattern(
@@ -250,15 +294,10 @@ async def store_query_pattern(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 3A — FEEDBACK FUNCTIONS
+# PHASE 3A — FEEDBACK FUNCTIONS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def increment_pattern_success(nl_question: str, database_id: str) -> bool:
-    """
-    Thumbs-up feedback: raise the pattern's success_count by 1.
-    Higher success_count → pattern ranks higher in future similarity searches.
-    Returns True if the pattern was found and updated.
-    """
     now    = datetime.now(timezone.utc).isoformat()
     cypher = """
         MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
@@ -274,11 +313,6 @@ async def increment_pattern_success(nl_question: str, database_id: str) -> bool:
 
 
 async def decrement_pattern_success(nl_question: str, database_id: str) -> bool:
-    """
-    Thumbs-down feedback: lower the pattern's success_count.
-    Count never goes below 0 — pattern is not deleted, just de-weighted.
-    Returns True if the pattern was found and updated.
-    """
     now    = datetime.now(timezone.utc).isoformat()
     cypher = """
         MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
@@ -301,16 +335,11 @@ async def update_pattern_sql(
     database_id:   str,
     corrected_sql: str,
 ) -> bool:
-    """
-    User-supplied corrected SQL: replace the stored SQL in the QueryPattern.
-    Also bumps success_count so the corrected version ranks higher.
-    Returns True if the pattern was found and updated.
-    """
     now    = datetime.now(timezone.utc).isoformat()
     cypher = """
         MATCH (qp:QueryPattern {nl_question: $nl, database_id: $db_id})
         SET qp.sql           = $corrected_sql,
-            qp.success_count = qp.success_count + 2,   /* reward user-corrected patterns */
+            qp.success_count = qp.success_count + 2,
             qp.last_used     = $now
         RETURN count(qp) AS updated
     """
@@ -325,7 +354,7 @@ async def update_pattern_sql(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INGESTION-TIME FUNCTIONS (unchanged from v2)
+# INGESTION-TIME FUNCTIONS (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def create_indexes(session) -> None:
