@@ -14,7 +14,7 @@ import json
 import logging
 import os
 
-from backend.mcp_client.base import MCPClientSession
+from backend.mcp_client.pool import MCPConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,11 @@ class Neo4jMCPClient:
     """
 
     def __init__(self, server_url: str = NEO4J_MCP_URL) -> None:
-        self._session = MCPClientSession(server_url, name="neo4j")
+        self._session = MCPConnectionPool(server_url, name="neo4j")
+
+    @property
+    def pool_stats(self) -> dict:
+        return self._session.stats
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -126,6 +130,31 @@ class Neo4jMCPClient:
             logger.warning("[neo4j-mcp] get_join_path fallback: %s", exc)
             from backend.services import neo4j_service
             return await neo4j_service.get_join_path(table1, table2, database_id)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # get_join_paths_batch
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def get_join_paths_batch(
+        self,
+        table_names: list[str],
+        database_id: str,
+    ) -> list[dict]:
+        """
+        Shortest FK join paths between all pairs of candidate tables.
+
+        Returns list of path objects.
+        """
+        try:
+            result = await self._session.call_tool("get_join_paths_batch", {
+                "table_names_json": json.dumps(table_names),
+                "database_id":      database_id,
+            })
+            return result if isinstance(result, list) else []
+        except Exception as exc:
+            logger.warning("[neo4j-mcp] get_join_paths_batch fallback: %s", exc)
+            from backend.services import neo4j_service
+            return await neo4j_service.get_join_paths_batch(table_names, database_id)
 
     # ══════════════════════════════════════════════════════════════════════════
     # get_cross_db_hints
