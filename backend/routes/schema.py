@@ -1,18 +1,19 @@
 """
-backend/routes/schema.py  (v2 + Phase 3A feedback + Phase 3B MCP routing)
+backend/routes/schema.py  (v2 + Phase 3A feedback + Phase 3B MCP routing + Phase 4B)
 
-Phase 3B changes:
-  /api/schema    → reads from neo4j_mcp.get_schema_summary()
-  /api/feedback  → writes through neo4j_mcp.record_feedback()
+Phase 4B change:
+  POST /api/feedback with action="correct" now also invalidates the
+  result_cache and schema_cache for the affected database, ensuring
+  future queries re-execute rather than serving stale cached results.
 
-Both fall back to direct neo4j_service calls when the MCP server
-is unavailable, ensuring the API stays live during MCP restarts.
+GET /api/health now includes pool stats and cache stats from Phase 4.
 """
 
 from fastapi import APIRouter
 
 from backend.db_manager import db_manager
 from backend.mcp_client import neo4j_mcp
+from backend.cache import result_cache, schema_cache, all_cache_stats
 from backend.models import (
     SchemaResponse, DatabaseSummary, DomainSummary, TableSummary,
     FeedbackRequest,
@@ -36,15 +37,14 @@ EXAMPLE_QUESTIONS = [
 @router.get("/health")
 async def health():
     """
-    Liveness check. Reports Oracle DB config status and MCP server reachability.
+    Liveness check. Reports Oracle DB config, MCP pool stats, and cache stats.
     """
     dbs = [
         {"id": d.id, "name": d.name, "configured": d.is_configured}
         for d in db_manager.databases
     ]
 
-    # Probe both MCP servers (non-blocking — failures don't break health)
-    from backend.mcp_client import oracle_mcp
+    from backend.mcp_client import oracle_mcp, mcp_pool_stats
     oracle_mcp_ok = await oracle_mcp.ping()
     neo4j_mcp_ok  = await neo4j_mcp.ping()
 
@@ -55,6 +55,10 @@ async def health():
             "oracle": "up" if oracle_mcp_ok else "down (fallback active)",
             "neo4j":  "up" if neo4j_mcp_ok  else "down (fallback active)",
         },
+        # Phase 4C — pool metrics
+        "mcp_pools":  mcp_pool_stats(),
+        # Phase 4B — cache metrics
+        "caches":     all_cache_stats(),
     }
 
 
@@ -64,8 +68,7 @@ async def health():
 async def schema():
     """
     Return all databases with enriched tables and business domains.
-    Reads from Neo4j via MCP — no Oracle queries at UI load time.
-    Falls back to direct neo4j_service on MCP failure.
+    Reads from Neo4j via MCP pool — no Oracle queries at UI load time.
     """
     raw          = await neo4j_mcp.get_schema_summary()
     db_summaries: list[DatabaseSummary] = []
@@ -75,7 +78,6 @@ async def schema():
         tables  = db_raw.get("tables",  []) or []
         domains = db_raw.get("domains", []) or []
 
-        # Deduplicate tables (Cypher collect() may produce nulls)
         seen: set[str] = set()
         table_summaries: list[TableSummary] = []
         for t in tables:
@@ -91,7 +93,6 @@ async def schema():
                 domain           = t.get("domain") or "",
             ))
 
-        # Deduplicate domains
         seen_d: set[str] = set()
         domain_summaries: list[DomainSummary] = []
         for d in domains:
@@ -124,7 +125,6 @@ async def schema():
 
 @router.get("/databases")
 async def databases():
-    """Quick list of registered databases for the UI DB-selector dropdown."""
     return {
         "databases": [
             {
@@ -145,22 +145,24 @@ async def examples():
     return {"examples": EXAMPLE_QUESTIONS}
 
 
-# ── Feedback (Phase 3A + 3B MCP routing) ──────────────────────────────────────
+# ── Feedback (Phase 3A + 3B + Phase 4B cache invalidation) ────────────────────
 
 @router.post("/feedback")
 async def feedback(request: FeedbackRequest):
     """
     Record user feedback on a generated SQL result.
 
-    Phase 3B: routed through Neo4j MCP server (neo4j_mcp.record_feedback).
-    Falls back to direct neo4j_service calls on MCP failure.
+    Phase 4B addition: when action="correct" is received, invalidate
+    the result_cache and schema_cache for this database so future
+    identical queries re-execute with fresh data rather than serving
+    a result that was based on wrong SQL.
 
-    rating ≥ 4  (thumbs up)   → action="increment"  success_count + 1
+    rating ≥ 4  (thumbs up)  → action="increment"  success_count + 1
     rating < 4  (thumbs down) → action="decrement"  success_count - 1
-    corrected_sql provided    → action="correct"     replace stored SQL + 2
+    corrected_sql provided    → action="correct"     replace + invalidate caches
     """
-    updated      = False
-    corrected    = (request.corrected_sql or "").strip()
+    updated   = False
+    corrected = (request.corrected_sql or "").strip()
 
     if request.rating >= 4:
         updated = await neo4j_mcp.record_feedback(
@@ -175,7 +177,8 @@ async def feedback(request: FeedbackRequest):
             action      = "decrement",
         )
 
-    # Correction is additive — apply on top of any rating
+    # Correction is additive on top of any rating
+    cache_invalidated = False
     if corrected:
         await neo4j_mcp.record_feedback(
             nl_question   = request.nl_question,
@@ -183,10 +186,15 @@ async def feedback(request: FeedbackRequest):
             action        = "correct",
             corrected_sql = corrected,
         )
+        # Phase 4B: invalidate stale cached results for this database
+        n_result = result_cache.invalidate_db(request.db_id)
+        n_schema = schema_cache.invalidate_db(request.db_id)
+        cache_invalidated = True
 
     return {
-        "status":          "recorded" if updated else "pattern_not_found",
-        "rating":          request.rating,
-        "question":        request.nl_question[:80],
-        "has_correction":  bool(corrected),
+        "status":            "recorded" if updated else "pattern_not_found",
+        "rating":            request.rating,
+        "question":          request.nl_question[:80],
+        "has_correction":    bool(corrected),
+        "cache_invalidated": cache_invalidated,
     }
