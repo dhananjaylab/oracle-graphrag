@@ -1,19 +1,28 @@
 """
-backend/services/gemini_service.py  (v2 + Phase 3A)
+backend/services/gemini_service.py  (Phase 4D)
 
-New: heal_sql() — called by SelfHealingAgent to fix broken Oracle SQL.
-     Uses temperature=0 for fully deterministic repair output.
+Phase 4D additions:
+  _is_retryable()      — detects 429 / 503 / timeout errors from Gemini
+  _gemini_with_retry() — exponential backoff wrapper (max 3 attempts,
+                         2s → 4s → 8s + jitter)
+
+Applied to:
+  generate_sql()       — SQL generation at query time
+  heal_sql()           — SelfHealingAgent repair calls
+  summarize_results()  — Result summarisation at query time
+  enrich_columns()     — Ingestion-time column enrichment (sync → wrapped)
 
 Data privacy guarantee (unchanged):
-  enrich_columns  → column names + data types only
-  generate_sql    → schema metadata + enriched descriptions only
-  heal_sql        → failed SQL + error message + schema metadata only
-  summarize_results → aggregate statistics only (sum/avg/min/max/count)
+  Only schema metadata + aggregate stats reach Gemini.
   Raw Oracle row data NEVER leaves on-prem.
 """
 
+import asyncio
 import json
+import logging
+import random
 import re
+
 import google.generativeai as genai
 
 from backend.config import settings
@@ -21,19 +30,88 @@ from backend.prompts.sql_prompt import SQL_SYSTEM_PROMPT
 from backend.prompts.enrichment_prompt import build_enrichment_prompt
 from backend.prompts.healing_prompt import HEALING_SYSTEM_PROMPT
 
+logger = logging.getLogger(__name__)
+
 genai.configure(api_key=settings.gemini_api_key)
 
 _flash = genai.GenerativeModel("gemini-flash-latest")
+
+# Retry configuration
+_MAX_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY_S = 2.0
+_RETRY_MAX_DELAY_S  = 30.0
+
+
+# ── Retry helpers ─────────────────────────────────────────────────────────────
+
+def _is_retryable(exc: Exception) -> bool:
+    """
+    Return True for transient Gemini API errors that are safe to retry:
+    rate limits (429), service unavailability (503), and timeouts.
+    Does NOT retry on authentication errors, invalid arguments, or
+    context-length violations.
+    """
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "429",
+        "quota",
+        "resource exhausted",
+        "rate limit",
+        "503",
+        "service unavailable",
+        "timeout",
+        "deadline exceeded",
+        "connection reset",
+        "connection error",
+    ))
+
+
+async def _gemini_with_retry(coro_factory, label: str = "gemini"):
+    """
+    Execute an async Gemini coroutine with exponential backoff + jitter.
+
+    coro_factory: zero-argument callable that returns a fresh coroutine
+                  (must be a factory, not an already-started coroutine,
+                  so we can retry without reusing a consumed coroutine).
+
+    Raises the final exception after all attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            if _is_retryable(exc) and attempt < _MAX_RETRY_ATTEMPTS:
+                delay = min(
+                    _RETRY_BASE_DELAY_S * (2 ** (attempt - 1)) + random.uniform(0, 1),
+                    _RETRY_MAX_DELAY_S,
+                )
+                logger.warning(
+                    "[%s] Retryable error (attempt %d/%d): %s — retrying in %.1fs",
+                    label, attempt, _MAX_RETRY_ATTEMPTS, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                last_exc = exc
+            else:
+                raise
+    # Should not reach here but satisfies type checker
+    if last_exc:
+        raise last_exc
 
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 def get_embedding(text: str) -> list[float]:
-    """3072-dim embedding via gemini-embedding-001."""
+    """
+    3072-dim embedding via gemini-embedding-001.
+    Called via asyncio.to_thread — sync call is intentional here.
+    Caller (query.py) wraps this with the EmbeddingCache, so the
+    Gemini API is only called on cache misses.
+    """
     result = genai.embed_content(
-        model="models/gemini-embedding-001",
-        content=text,
-        task_type="retrieval_document",
+        model     = "models/gemini-embedding-001",
+        content   = text,
+        task_type = "retrieval_document",
     )
     return result["embedding"]
 
@@ -41,14 +119,15 @@ def get_embedding(text: str) -> list[float]:
 # ── Column enrichment (ingestion time) ────────────────────────────────────────
 
 def enrich_columns(
-    table_name:   str,
+    table_name:    str,
     table_comment: str,
-    columns:      list[dict],
-    db_name:      str = "",
-    domain_hint:  str = "",
+    columns:       list[dict],
+    db_name:       str = "",
+    domain_hint:   str = "",
 ) -> list[dict]:
     """
     Batch-enrich cryptic column names with business labels + descriptions.
+    Sync function called from ingestion pipeline.
     Sends only column names and data types — no actual data values.
     """
     prompt = build_enrichment_prompt(
@@ -91,6 +170,8 @@ async def generate_sql(
     Generate Oracle SQL from NL question + schema context.
     Injects matched QueryPatterns as dynamic few-shot examples.
     Only schema metadata is sent to Gemini — never raw Oracle data.
+
+    Retries up to 3 times on 429/503/timeout errors.
     """
     model = genai.GenerativeModel(
         "gemini-flash-latest",
@@ -124,13 +205,16 @@ async def generate_sql(
         "Generate Oracle SQL only. No explanation, no markdown, no code fences."
     )
 
-    response = await chat.send_message_async(
-        user_message,
-        generation_config=genai.types.GenerationConfig(temperature=0.1),
-    )
+    generation_config = genai.types.GenerationConfig(temperature=0.1)
 
-    sql = _clean_sql(response.text)
-    return {"sql": sql, "model": "gemini-flash-latest"}
+    async def _call():
+        response = await chat.send_message_async(
+            user_message,
+            generation_config=generation_config,
+        )
+        return {"sql": _clean_sql(response.text), "model": "gemini-flash-latest"}
+
+    return await _gemini_with_retry(_call, label="generate_sql")
 
 
 # ── SQL healing (SelfHealingAgent) ────────────────────────────────────────────
@@ -139,30 +223,24 @@ async def heal_sql(healing_message: str, db_name: str) -> dict:
     """
     Ask Gemini to fix a broken SQL query with error-specific guidance.
 
-    Called by SelfHealingAgent on each retry attempt.
     Uses temperature=0 for fully deterministic, reproducible fixes.
+    Retries up to 3 times on transient Gemini errors.
 
-    healing_message is built by prompts/healing_prompt.py and contains:
-      - The failed SQL
-      - The exact Oracle error (ORA-XXXXX or category)
-      - A targeted fix strategy for that error type
-      - The schema context (table/column metadata only)
-      - The original user question
-
-    Only schema metadata + the failed SQL reach Gemini — no actual data rows.
+    Only schema metadata + the failed SQL reach Gemini — no data rows.
     """
     model = genai.GenerativeModel(
         "gemini-flash-latest",
         system_instruction=HEALING_SYSTEM_PROMPT,
     )
-    response = await model.generate_content_async(
-        f"Database: {db_name}\n\n{healing_message}",
-        generation_config=genai.types.GenerationConfig(
-            temperature=0.0,    # deterministic for repair tasks
-        ),
-    )
-    sql = _clean_sql(response.text)
-    return {"sql": sql, "model": "gemini-flash-latest"}
+
+    async def _call():
+        response = await model.generate_content_async(
+            f"Database: {db_name}\n\n{healing_message}",
+            generation_config=genai.types.GenerationConfig(temperature=0.0),
+        )
+        return {"sql": _clean_sql(response.text), "model": "gemini-flash-latest"}
+
+    return await _gemini_with_retry(_call, label="heal_sql")
 
 
 # ── Result summarization (query time) ─────────────────────────────────────────
@@ -177,6 +255,7 @@ async def summarize_results(
     """
     Plain-English summary from aggregated statistics only.
     Individual row values are never sent to Gemini.
+    Retries up to 3 times on transient errors.
     """
     stats_lines = [f"Total rows returned: {row_count}"]
     for col, stat in summary_stats.items():
@@ -202,8 +281,12 @@ async def summarize_results(
         "- Never mention SQL, database, or technical terms\n"
         "- Never start with 'Based on the data' or 'The results show'"
     )
-    response = await _flash.generate_content_async(prompt)
-    return response.text.strip()
+
+    async def _call():
+        response = await _flash.generate_content_async(prompt)
+        return response.text.strip()
+
+    return await _gemini_with_retry(_call, label="summarize_results")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
