@@ -1,9 +1,11 @@
 """
-backend/main.py  (v2 + Phase 3B + Phase 3C)
+backend/main.py  (Phase 4)
 
-Phase 3C adds:
-  POST /api/supervisor  — SSE streaming supervisor endpoint
-  Feature flag is handled on the client side (Streamlit toggle).
+Phase 4 changes vs Phase 3C:
+  • lifespan connects pool-based oracle_mcp / neo4j_mcp
+    (MCPConnectionPool instead of MCPClientSession)
+  • /api/health (via schema.py) now returns pool stats + cache stats
+  • Cache singletons are imported to ensure they are initialised on startup
 """
 
 import logging
@@ -17,21 +19,30 @@ from backend.routes import query, schema
 from backend.routes.supervisor import router as supervisor_router
 from backend.services.neo4j_service import close_driver
 
+# Ensure cache singletons are initialised at import time
+from backend.cache import embedding_cache, schema_cache, result_cache  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Startup: connect MCP pools ─────────────────────────────────────────
     from backend.mcp_client import oracle_mcp, neo4j_mcp
-    for client, label in [(oracle_mcp, "Oracle MCP"), (neo4j_mcp, "Neo4j MCP")]:
+    for client, label in [(oracle_mcp, "Oracle MCP pool"), (neo4j_mcp, "Neo4j MCP pool")]:
         try:
             await client.connect()
             alive = await client.ping()
-            logger.info("[%s] Connected — ping=%s", label, alive)
+            logger.info("[%s] Connected — ping=%s  stats=%s",
+                        label, alive, client.pool_stats)
         except Exception as exc:
             logger.warning("[%s] Unavailable (%s) — fallback active.", label, exc)
+
     yield
-    for client, label in [(oracle_mcp, "Oracle MCP"), (neo4j_mcp, "Neo4j MCP")]:
+
+    # ── Shutdown: drain pools ──────────────────────────────────────────────
+    from backend.mcp_client import oracle_mcp, neo4j_mcp
+    for client, label in [(oracle_mcp, "Oracle MCP pool"), (neo4j_mcp, "Neo4j MCP pool")]:
         try:
             await client.disconnect()
         except Exception as exc:
@@ -42,7 +53,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title       = "NL-SQL Banking API",
     description = "Natural language → Oracle SQL · GraphRAG + Gemini + MCP + Supervisor",
-    version     = "3.1.0",
+    version     = "4.0.0",
     lifespan    = lifespan,
 )
 
@@ -55,7 +66,7 @@ app.add_middleware(
 
 app.include_router(query.router,      prefix="/api")
 app.include_router(schema.router,     prefix="/api")
-app.include_router(supervisor_router, prefix="/api")  # Phase 3C
+app.include_router(supervisor_router, prefix="/api")
 
 
 @app.exception_handler(Exception)
