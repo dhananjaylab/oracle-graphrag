@@ -170,6 +170,21 @@ GET_JOIN_PATH = _fn(
     required = ["table1", "table2", "database_id"],
 )
 
+GET_JOIN_PATHS_BATCH = _fn(
+    name = "get_join_paths_batch",
+    description = (
+        "Find shortest FK join paths between ALL pairs of candidate tables in a single Neo4j query. "
+        "Replaces multiple sequential get_join_path() calls. "
+        "Use this batch tool whenever you have 2 or more candidate tables in a database."
+    ),
+    properties = {
+        "table_names_json": _str("JSON-serialized list[str] of all candidate table names"),
+        "database_id":      _str("Database identifier"),
+    },
+    required = ["table_names_json", "database_id"],
+)
+
+
 GET_CROSS_DB_HINTS = _fn(
     name = "get_cross_db_hints",
     description = (
@@ -284,6 +299,7 @@ SUPERVISOR_TOOLS = Tool(function_declarations=[
     SEMANTIC_SEARCH,
     GET_TABLE_DETAILS,
     GET_JOIN_PATH,
+    GET_JOIN_PATHS_BATCH,
     GET_CROSS_DB_HINTS,
     SEARCH_PATTERNS,
     STORE_PATTERN,
@@ -294,7 +310,7 @@ SUPERVISOR_TOOLS = Tool(function_declarations=[
 
 # Set of tool names the supervisor can call
 ORACLE_TOOL_NAMES  = {"execute_query", "explain_plan", "get_schema", "list_databases", "check_read_only"}
-NEO4J_TOOL_NAMES   = {"semantic_search", "get_table_details", "get_join_path", "get_cross_db_hints",
-                       "search_patterns", "store_pattern", "get_schema_summary"}
+NEO4J_TOOL_NAMES   = {"semantic_search", "get_table_details", "get_join_path", "get_join_paths_batch",
+                      "get_cross_db_hints", "search_patterns", "store_pattern", "get_schema_summary"}
 CONTROL_TOOL_NAMES = {"finish"}
 ALL_TOOL_NAMES     = ORACLE_TOOL_NAMES | NEO4J_TOOL_NAMES | CONTROL_TOOL_NAMES

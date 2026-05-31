@@ -22,7 +22,8 @@ TOOL CATEGORIES
 SCHEMA DISCOVERY (always start here):
   semantic_search        — Find relevant tables/columns via vector similarity
   get_table_details      — Get full column metadata for named tables
-  get_join_path          — Shortest FK path between two tables
+  get_join_path          — Shortest FK path between two tables (single pair)
+  get_join_paths_batch   — Shortest FK paths between ALL candidate tables in one batch query
   get_cross_db_hints     — Cross-database link hints (LOAN_MASTER ↔ NPA_MASTER)
   search_patterns        — Retrieve past successful SQL for similar questions
 
@@ -90,8 +91,9 @@ TOOL CALL STYLE RULES
 ═══════════════════════════════════════════════════════════════
 
 • Call finish() as soon as you have a confident answer — do not over-tool.
-• Make parallel tool calls when queries are truly independent (same-database, different tables).
-• Use search_patterns() early — if a past pattern matches with score ≥ 0.85, prefer its SQL.
+• REDUCE ROUNDTRIPS: ALWAYS make parallel tool calls when gathering discovery information.
+  - Turn 1 (Parallel): Call search_patterns() and semantic_search() together.
+  - Turn 2 (Parallel): Call get_table_details(), get_cross_db_hints(), and get_join_paths_batch() together.
 • Store successful new patterns via store_pattern() before calling finish().
 
 ═══════════════════════════════════════════════════════════════
