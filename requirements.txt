@@ -11,19 +11,23 @@ neo4j==5.19.0
 # ── Google Gemini SDK — function calling used by Phase 3C supervisor ──────────
 google-generativeai==0.7.2
 
-# ── Phase 3B+3C: MCP SDK ──────────────────────────────────────────────────────
-# fastmcp is the standalone high-level FastMCP server package.
-# mcp[cli] provides the low-level client (ClientSession, sse_client) used in
-# backend/mcp_client/base.py for persistent SSE connections.
-fastmcp>=0.2.0
-mcp[cli]>=1.0.0,<2.0.0
+# ── MCP SDK — Streamable HTTP transport (stateless) ────────────────────────────
+# Both the Oracle/Neo4j MCP servers and the FastAPI backend's MCP clients now
+# use the official `mcp` SDK exclusively:
+#   • Servers: mcp.server.fastmcp.FastMCP (stateless_http=True, json_response=True)
+#   • Clients: mcp.client.streamable_http.streamablehttp_client
+# The third-party `fastmcp` package is no longer used — standardizing on the
+# official SDK avoids relying on a second package's host/port/transport API,
+# which has changed shape across its own major versions. Verify this floor
+# against the latest published 1.x release before pinning a CI lockfile.
+mcp[cli]>=1.10.0,<2.0.0
 
 # ── Config + YAML ──────────────────────────────────────────────────────────────
 pydantic-settings>=2.6.1
 python-dotenv==1.0.1
 PyYAML==6.0.1
 
-# ── HTTP client — Streamlit → FastAPI, MCP SSE transport, Phase 3C streaming ──
+# ── HTTP client — Streamlit → FastAPI, MCP Streamable HTTP transport ──────────
 httpx>=0.28.1
 httpx-sse==0.4.0
 

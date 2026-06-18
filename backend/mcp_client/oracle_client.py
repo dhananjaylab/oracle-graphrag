@@ -1,19 +1,24 @@
 """
 backend/mcp_client/oracle_client.py
 
-OracleMCPClient — typed wrapper around MCPClientSession for Oracle tools.
+OracleMCPClient — typed wrapper around MCPConnectionPool for Oracle tools.
 
-Each method corresponds to one Oracle MCP tool.  If the MCP server is
-unavailable (not started, crashed), the client falls back transparently
-to calling backend.services.oracle_service directly so the query
-pipeline degrades gracefully rather than failing hard.
+Each method corresponds to one Oracle MCP tool. If the MCP server is
+unavailable (not started, crashed, or the circuit breaker is open), the
+client falls back transparently to calling backend.services.oracle_service
+directly so the query pipeline degrades gracefully rather than failing hard.
 
 Fallback behaviour is logged at WARNING level.
+
+CHANGED: accepts an optional bearer token (from ORACLE_MCP_TOKEN) that's
+forwarded to every pooled session as an Authorization header. This is
+plumbing for a service-to-service token today; a full OAuth 2.1 client
+flow (mcp.client.auth.OAuthClientProvider) is a separate piece of work
+if/when interactive user-delegated auth to the MCP server is needed.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from backend.mcp_client.pool import MCPConnectionPool
@@ -22,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 # ── MCP server URL (can be overridden via env) ─────────────────────────────────
 import os
-ORACLE_MCP_URL = os.getenv("ORACLE_MCP_URL", "http://localhost:8001")
+ORACLE_MCP_URL   = os.getenv("ORACLE_MCP_URL", "http://localhost:8001")
+ORACLE_MCP_TOKEN = os.getenv("ORACLE_MCP_TOKEN")  # optional static bearer token
 
 
 class OracleMCPClient:
@@ -34,7 +40,9 @@ class OracleMCPClient:
     """
 
     def __init__(self, server_url: str = ORACLE_MCP_URL) -> None:
-        self._session = MCPConnectionPool(server_url, name="oracle")
+        self._session = MCPConnectionPool(
+            server_url, name="oracle", auth_token=ORACLE_MCP_TOKEN,
+        )
 
     @property
     def pool_stats(self) -> dict:

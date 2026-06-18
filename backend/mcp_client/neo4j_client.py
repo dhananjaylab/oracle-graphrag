@@ -1,11 +1,15 @@
 """
 backend/mcp_client/neo4j_client.py
 
-Neo4jMCPClient — typed wrapper around MCPClientSession for Neo4j tools.
+Neo4jMCPClient — typed wrapper around MCPConnectionPool for Neo4j tools.
 
 All methods serialize complex arguments (embeddings, list[str]) to JSON
 before sending to the MCP server, matching the FastMCP tool signatures.
 Falls back to direct backend.services.neo4j_service calls on MCP failure.
+
+CHANGED: accepts an optional bearer token (from NEO4J_MCP_TOKEN) that's
+forwarded to every pooled session as an Authorization header — see the
+matching note in oracle_client.py for scope/limitations.
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ from backend.mcp_client.pool import MCPConnectionPool
 
 logger = logging.getLogger(__name__)
 
-NEO4J_MCP_URL = os.getenv("NEO4J_MCP_URL", "http://localhost:8002")
+NEO4J_MCP_URL   = os.getenv("NEO4J_MCP_URL", "http://localhost:8002")
+NEO4J_MCP_TOKEN = os.getenv("NEO4J_MCP_TOKEN")  # optional static bearer token
 
 
 class Neo4jMCPClient:
@@ -30,7 +35,9 @@ class Neo4jMCPClient:
     """
 
     def __init__(self, server_url: str = NEO4J_MCP_URL) -> None:
-        self._session = MCPConnectionPool(server_url, name="neo4j")
+        self._session = MCPConnectionPool(
+            server_url, name="neo4j", auth_token=NEO4J_MCP_TOKEN,
+        )
 
     @property
     def pool_stats(self) -> dict:
