@@ -11,6 +11,11 @@
 # Phase 3C adds POST /api/supervisor (SSE) to the backend.
 # The Streamlit toggle "Supervisor mode" switches between linear + supervisor.
 #
+# CHANGED: the two MCP servers now run Streamable HTTP (stateless) instead of
+# the legacy SSE transport — see mcp_servers/*/server.py. Their endpoint is
+# now mounted at /mcp instead of /sse; only the printed banner below changed,
+# the startup/health-check logic (TCP port checks) is unaffected.
+#
 # Usage:
 #   chmod +x start_servers.sh && ./start_servers.sh
 #   ./start_servers.sh --no-streamlit
@@ -75,7 +80,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # 1. Oracle MCP
-log "Starting Oracle MCP on :${ORACLE_MCP_PORT}…"
+log "Starting Oracle MCP on :${ORACLE_MCP_PORT}… (transport=streamable-http, stateless)"
 ORACLE_MCP_URL="http://localhost:${ORACLE_MCP_PORT}" \
 python3 -m mcp_servers.oracle_mcp.server \
     --host "$ORACLE_MCP_HOST" --port "$ORACLE_MCP_PORT" \
@@ -83,7 +88,7 @@ python3 -m mcp_servers.oracle_mcp.server \
 echo $! >> "$PID_FILE"
 
 # 2. Neo4j MCP
-log "Starting Neo4j MCP on :${NEO4J_MCP_PORT}…"
+log "Starting Neo4j MCP on :${NEO4J_MCP_PORT}… (transport=streamable-http, stateless)"
 NEO4J_MCP_URL="http://localhost:${NEO4J_MCP_PORT}" \
 python3 -m mcp_servers.neo4j_mcp.server \
     --host "$NEO4J_MCP_HOST" --port "$NEO4J_MCP_PORT" \
@@ -121,8 +126,8 @@ log "All servers running:"
 echo ""
 echo "    🖥  Frontend:     http://localhost:${STREAMLIT_PORT}"
 echo "    🔌  API + docs:   http://localhost:${BACKEND_PORT}/docs"
-echo "    🗄  Oracle MCP:   http://localhost:${ORACLE_MCP_PORT}/sse"
-echo "    🌐  Neo4j MCP:    http://localhost:${NEO4J_MCP_PORT}/sse"
+echo "    🗄  Oracle MCP:   http://localhost:${ORACLE_MCP_PORT}/mcp"
+echo "    🌐  Neo4j MCP:    http://localhost:${NEO4J_MCP_PORT}/mcp"
 echo ""
 echo "    Phase 3C endpoints:"
 echo "    POST /api/query       — linear pipeline (fast, single-DB)"
