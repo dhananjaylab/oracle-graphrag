@@ -1,6 +1,6 @@
 # ── Web framework ──────────────────────────────────────────────────────────────
 fastapi>=0.115.0
-uvicorn[standard]==0.29.0
+uvicorn[standard]>=0.31.1
 
 # ── Oracle DB driver — thin mode, no Oracle Instant Client ─────────────────────
 oracledb==4.0.0
