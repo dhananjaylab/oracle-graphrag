@@ -1,26 +1,23 @@
 """
-mcp_servers/neo4j_mcp/server.py  (Phase 4A — adds get_join_paths_batch)
-                                  (+ Streamable HTTP / stateless migration)
+mcp_servers/neo4j_mcp/server.py  (Phase 4A + Streamable HTTP + health routes)
 
-Phase 4A change: new get_join_paths_batch tool that finds FK join paths
-between ALL pairs of candidate tables in a single Cypher query, replacing
-the N−1 sequential get_join_path loop in the query pipeline.
+CHANGES vs previous version
+────────────────────────────
+  1. @mcp.custom_route("/health", methods=["GET"])
+     Liveness probe — returns 200 as long as the process is up and the
+     Neo4j driver has been initialised.
 
-Streamable HTTP migration — same rationale as mcp_servers/oracle_mcp/server.py:
-  • Built on the official SDK's `mcp.server.fastmcp.FastMCP` rather than the
-    third-party `fastmcp` package, for a stable, documented host/port/
-    stateless_http/json_response API.
-  • stateless_http=True removes the in-memory session pinning that SSE
-    required, so this server can sit behind a plain round-robin load
-    balancer with multiple replicas — no sticky sessions, no shared
-    session store.
-  • Endpoint moves from /sse to /mcp.
+  2. @mcp.custom_route("/ready", methods=["GET"])
+     Readiness probe — runs a lightweight Cypher (RETURN 1) against the
+     live Neo4j instance. Returns 503 if Neo4j is unreachable so the load
+     balancer removes this replica from rotation.
 
-All tool behavior is unchanged from the SSE version.
+  3. All tool logic is unchanged from the previous version.
 """
 
 import json
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +28,9 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
 import backend.services.neo4j_service as neo4j_svc
 
 mcp = FastMCP(
@@ -39,48 +39,72 @@ mcp = FastMCP(
     json_response  = True,
 )
 
+_SERVER_START = time.monotonic()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TOOL: semantic_search
+# OPERATIONAL ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Liveness probe — fast, no Neo4j query."""
+    return JSONResponse({
+        "status":   "healthy",
+        "service":  "neo4j-mcp-server",
+        "uptime_s": round(time.monotonic() - _SERVER_START, 1),
+    })
+
+
+@mcp.custom_route("/ready", methods=["GET"])
+async def ready(request: Request) -> JSONResponse:
+    """
+    Readiness probe — executes RETURN 1 against Neo4j.
+    Returns 503 if the database is unreachable.
+    """
+    try:
+        driver = neo4j_svc.get_driver()
+        async with driver.session() as session:
+            result = await session.run("RETURN 1 AS ok")
+            await result.single()
+        return JSONResponse({"status": "ready", "neo4j": "reachable"})
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "not_ready", "neo4j": "unreachable", "error": str(exc)},
+            status_code=503,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOLS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-async def semantic_search(
-    embedding_json: str,
-    database_id:    str,
-    top_k:          int = 12,
-) -> str:
+async def semantic_search(embedding_json: str, database_id: str, top_k: int = 12) -> str:
     """
-    Vector cosine-similarity search on (:Table) and (:Column) nodes
-    scoped to one database.
+    Vector cosine-similarity search on (:Table) and (:Column) nodes.
 
     Args:
-        embedding_json: JSON-serialized list[float] — 3072-dim question embedding.
+        embedding_json: JSON list[float] — 3072-dim question embedding.
         database_id:    Database identifier (e.g. "fincore").
-        top_k:          Number of nearest neighbours to return per index.
+        top_k:          Nearest neighbours per index.
 
     Returns JSON: {tables, columns, cypher_used}
     """
     embedding: list[float] = json.loads(embedding_json)
     result = await neo4j_svc.semantic_schema_search(
-        query_embedding=embedding,
-        database_id=database_id,
-        top_k=top_k,
+        query_embedding=embedding, database_id=database_id, top_k=top_k,
     )
     return json.dumps(result, default=str)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_table_details
-# ══════════════════════════════════════════════════════════════════════════════
-
 @mcp.tool()
 async def get_table_details(table_names_json: str, database_id: str) -> str:
     """
-    Retrieve full column metadata for a list of tables from the graph.
+    Full column metadata for a list of tables.
 
     Args:
-        table_names_json: JSON-serialized list[str] of table names.
+        table_names_json: JSON list[str] of table names.
         database_id:      Database identifier.
 
     Returns JSON: list of table objects with columns.
@@ -90,82 +114,36 @@ async def get_table_details(table_names_json: str, database_id: str) -> str:
     return json.dumps(result, default=str)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_join_path  (single pair — kept for backward compat)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @mcp.tool()
 async def get_join_path(table1: str, table2: str, database_id: str) -> str:
-    """
-    Find the shortest FK-based join path between two tables.
-
-    Args:
-        table1:      Source table name.
-        table2:      Target table name.
-        database_id: Database identifier.
-
-    Returns JSON: list of path objects (empty list = no path found).
-    """
+    """Shortest FK join path between two tables (single pair, kept for compat)."""
     result = await neo4j_svc.get_join_path(table1, table2, database_id)
     return json.dumps(result, default=str)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_join_paths_batch  (Phase 4A)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @mcp.tool()
 async def get_join_paths_batch(table_names_json: str, database_id: str) -> str:
     """
-    Find shortest FK join paths between ALL pairs of candidate tables in a
-    single Cypher query.
-
-    Replaces the previous O(N) sequential get_join_path loop in the
-    query pipeline. For N candidate tables, this issues one Neo4j query
-    instead of N−1.
+    Shortest FK paths between ALL pairs of candidate tables in one Cypher query.
 
     Args:
-        table_names_json: JSON-serialized list[str] of all candidate table names.
+        table_names_json: JSON list[str] of candidate table names.
         database_id:      Database identifier.
 
-    Returns JSON: flat list of path objects, one per reachable pair:
-        [
-          {
-            "from_table":      "LOAN_MASTER",
-            "to_table":        "BRANCH_MASTER",
-            "table_sequence":  ["LOAN_MASTER", "BRANCH_MASTER"],
-            "join_conditions": [{"from_col": "BRCH_CD", "to_col": "BRCH_CD"}]
-          }, ...
-        ]
+    Returns JSON: [{from_table, to_table, table_sequence, join_conditions}, …]
     """
     table_names: list[str] = json.loads(table_names_json)
     result = await neo4j_svc.get_join_paths_batch(table_names, database_id)
     return json.dumps(result, default=str)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_cross_db_hints
-# ══════════════════════════════════════════════════════════════════════════════
-
 @mcp.tool()
 async def get_cross_db_hints(table_names_json: str, database_id: str) -> str:
-    """
-    Return cross-database CROSS_DB_JOIN edges for candidate tables.
-
-    Args:
-        table_names_json: JSON-serialized list[str] of table names.
-        database_id:      Source database identifier.
-
-    Returns JSON: list of cross-DB link objects.
-    """
+    """Cross-database CROSS_DB_JOIN edges for candidate tables."""
     table_names: list[str] = json.loads(table_names_json)
     result = await neo4j_svc.get_cross_db_hints(table_names, database_id)
     return json.dumps(result, default=str)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: search_patterns
-# ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def search_patterns(
@@ -174,30 +152,14 @@ async def search_patterns(
     top_k:          int   = 3,
     min_similarity: float = 0.85,
 ) -> str:
-    """
-    Find past QueryPattern nodes semantically similar to the current question.
-
-    Args:
-        embedding_json:  JSON-serialized list[float] question embedding.
-        database_id:     Database identifier.
-        top_k:           Max patterns to return.
-        min_similarity:  Cosine similarity threshold (default 0.85).
-
-    Returns JSON: list of matched pattern objects.
-    """
+    """Past QueryPattern nodes similar to the current question embedding."""
     embedding: list[float] = json.loads(embedding_json)
     result = await neo4j_svc.search_similar_patterns(
-        query_embedding=embedding,
-        database_id=database_id,
-        top_k=top_k,
-        min_similarity=min_similarity,
+        query_embedding=embedding, database_id=database_id,
+        top_k=top_k, min_similarity=min_similarity,
     )
     return json.dumps(result, default=str)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: store_pattern
-# ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def store_pattern(
@@ -209,56 +171,27 @@ async def store_pattern(
     execution_ms:     int,
     embedding_json:   str,
 ) -> str:
-    """
-    Persist a successful NL→SQL exchange as a (:QueryPattern) node.
-
-    Args:
-        database_id:       Database identifier.
-        nl_question:       Original natural language question.
-        sql:               Executed Oracle SQL.
-        schema_cypher:     Cypher queries used for schema discovery.
-        tables_used_json:  JSON-serialized list[str] of table names.
-        execution_ms:      Execution time in milliseconds.
-        embedding_json:    JSON-serialized list[float] question embedding.
-
-    Returns JSON: {"stored": true}
-    """
+    """Persist a successful NL→SQL exchange as a (:QueryPattern) node."""
     try:
         tables_used: list[str]   = json.loads(tables_used_json)
         embedding:   list[float] = json.loads(embedding_json)
         await neo4j_svc.store_query_pattern(
-            database_id   = database_id,
-            nl_question   = nl_question,
-            sql           = sql,
-            schema_cypher = schema_cypher,
-            tables_used   = tables_used,
-            execution_ms  = execution_ms,
-            embedding     = embedding,
+            database_id=database_id, nl_question=nl_question,
+            sql=sql, schema_cypher=schema_cypher,
+            tables_used=tables_used, execution_ms=execution_ms,
+            embedding=embedding,
         )
         return json.dumps({"stored": True})
     except Exception as exc:
         return json.dumps({"stored": False, "error": str(exc)})
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_schema_summary
-# ══════════════════════════════════════════════════════════════════════════════
-
 @mcp.tool()
 async def get_schema_summary() -> str:
-    """
-    Return all databases with their enriched tables and business domains.
-
-    Returns JSON: {databases: [{id, name, description, table_count,
-                                tables, domains}]}
-    """
+    """All databases with enriched tables and business domains."""
     result = await neo4j_svc.get_schema_summary()
     return json.dumps(result, default=str)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TOOL: record_feedback
-# ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def record_feedback(
@@ -269,12 +202,7 @@ async def record_feedback(
 ) -> str:
     """
     Update a QueryPattern weight based on user feedback.
-
-    action="increment"  → success_count + 1
-    action="decrement"  → success_count - 1 (floor 0)
-    action="correct"    → replace stored SQL, success_count + 2
-
-    Returns JSON: {"updated": bool, "action": str}
+    action: "increment" | "decrement" | "correct"
     """
     try:
         updated = False
@@ -300,11 +228,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8002)
     args = parser.parse_args()
 
-    print(f"[Neo4j MCP] Starting on {args.host}:{args.port} "
-          f"(transport=streamable-http, stateless_http=True)")
-    print(f"[Neo4j MCP] MCP endpoint: http://{args.host}:{args.port}/mcp")
+    print(f"[Neo4j MCP] Starting on {args.host}:{args.port}")
+    print(f"[Neo4j MCP]   MCP endpoint : http://{args.host}:{args.port}/mcp")
+    print(f"[Neo4j MCP]   Health probe : http://{args.host}:{args.port}/health")
+    print(f"[Neo4j MCP]   Ready probe  : http://{args.host}:{args.port}/ready")
 
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
-    mcp.settings.stateless_http = True
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host=args.host, port=args.port)
