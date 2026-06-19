@@ -330,4 +330,7 @@ if __name__ == "__main__":
     print(f"[Oracle MCP] Registered databases: "
           f"{[d.id for d in db_manager.databases]}")
 
-    mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.stateless_http = True
+    mcp.run(transport="streamable-http")

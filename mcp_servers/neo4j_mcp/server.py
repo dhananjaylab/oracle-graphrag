@@ -304,4 +304,7 @@ if __name__ == "__main__":
           f"(transport=streamable-http, stateless_http=True)")
     print(f"[Neo4j MCP] MCP endpoint: http://{args.host}:{args.port}/mcp")
 
-    mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.stateless_http = True
+    mcp.run(transport="streamable-http")
