@@ -41,3 +41,9 @@ openpyxl==3.1.2
 
 # ── Phase 3A: SQL validation — sqlglot Oracle dialect ─────────────────────────
 sqlglot==25.5.0
+
+# ── Redis client — shared cache across FastAPI replicas ────────────────────────
+# redis.asyncio is the async interface shipped inside redis-py >= 4.2.
+# If REDIS_URL is not set in .env, cache.py falls back to in-process dicts
+# automatically — this package is optional for local dev.
+redis>=4.6.0
