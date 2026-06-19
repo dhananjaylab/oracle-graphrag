@@ -76,7 +76,12 @@ class Neo4jMCPClient:
                 "database_id":    database_id,
                 "top_k":          top_k,
             })
-            return result
+            if isinstance(result, dict):
+                return result
+            # MCP returned a raw string (error/unexpected) — log and fall back
+            logger.warning("[neo4j-mcp] semantic_search: unexpected result type %s: %r",
+                           type(result).__name__, str(result)[:200])
+            raise ValueError(f"Non-dict result from MCP: {type(result).__name__}")
         except Exception as exc:
             logger.warning("[neo4j-mcp] semantic_search fallback: %s", exc)
             from backend.services import neo4j_service

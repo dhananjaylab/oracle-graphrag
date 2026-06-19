@@ -38,9 +38,12 @@ Pipeline steps
 """
 
 import asyncio
+import logging
 import os
 import time
 from fastapi import APIRouter, BackgroundTasks
+
+logger = logging.getLogger(__name__)
 
 from backend.db_manager import db_manager
 from backend.mcp_client import oracle_mcp, neo4j_mcp
@@ -126,6 +129,15 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
             "-- Pattern retrieval (parallel, Neo4j MCP: search_patterns):\n"
             "CALL db.index.vector.queryNodes('pattern_embeddings', $k, $embedding) …"
         )
+
+    # Normalise search_results — MCP may return a raw string on transient errors;
+    # treat anything that isn't a dict as an empty result so we fail gracefully.
+    if not isinstance(search_results, dict):
+        logger.warning(
+            "[query] semantic_search returned unexpected type %s — treating as empty",
+            type(search_results).__name__,
+        )
+        search_results = {}
 
     cypher_log.append(search_results.get("cypher_used", ""))
 
