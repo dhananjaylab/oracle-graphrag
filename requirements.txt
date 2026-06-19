@@ -1,6 +1,6 @@
 # ── Web framework ──────────────────────────────────────────────────────────────
 fastapi>=0.115.0
-uvicorn[standard]==0.29.0
+uvicorn[standard]>=0.31.1
 
 # ── Oracle DB driver — thin mode, no Oracle Instant Client ─────────────────────
 oracledb==4.0.0
@@ -20,7 +20,7 @@ google-generativeai==0.7.2
 # official SDK avoids relying on a second package's host/port/transport API,
 # which has changed shape across its own major versions. Verify this floor
 # against the latest published 1.x release before pinning a CI lockfile.
-mcp[cli]>=1.10.0,<2.0.0
+mcp[cli]>=1.28.0,<2.0.0
 
 # ── Config + YAML ──────────────────────────────────────────────────────────────
 pydantic-settings>=2.6.1
@@ -41,3 +41,9 @@ openpyxl==3.1.2
 
 # ── Phase 3A: SQL validation — sqlglot Oracle dialect ─────────────────────────
 sqlglot==25.5.0
+
+# ── Redis client — shared cache across FastAPI replicas ────────────────────────
+# redis.asyncio is the async interface shipped inside redis-py >= 4.2.
+# If REDIS_URL is not set in .env, cache.py falls back to in-process dicts
+# automatically — this package is optional for local dev.
+redis>=4.6.0

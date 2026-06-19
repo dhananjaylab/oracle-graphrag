@@ -1,0 +1,224 @@
+# docker-compose.yml — NL-SQL full production stack
+#
+# Services:
+#   redis          — shared cache backing store for all FastAPI replicas
+#   oracle-mcp-1   — Oracle MCP server replica 1
+#   oracle-mcp-2   — Oracle MCP server replica 2  (add more by copying)
+#   neo4j-mcp-1    — Neo4j  MCP server replica 1
+#   neo4j-mcp-2    — Neo4j  MCP server replica 2
+#   haproxy        — load balancer fronting both MCP tiers
+#   backend-1      — FastAPI app replica 1
+#   backend-2      — FastAPI app replica 2
+#   frontend       — Streamlit UI
+#
+# Usage:
+#   docker compose up --build
+#   docker compose up --scale oracle-mcp=3 --scale neo4j-mcp=3  (if using
+#   profiles instead of named replicas)
+#
+# Prerequisites:
+#   • .env file at project root with all credentials
+#   • databases.yaml at project root
+#   • Oracle DB and Neo4j reachable from within the Docker network (update
+#     *_DSN / NEO4J_URI to point at the real hosts, not localhost)
+
+version: "3.9"
+
+networks:
+  nlsql:
+    driver: bridge
+
+volumes:
+  redis-data:
+
+services:
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - nlsql
+    healthcheck:
+      test:     ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+
+  # ── Oracle MCP replicas ───────────────────────────────────────────────────────
+  oracle-mcp-1:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp-oracle
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      ORACLE_POOL_MIN: "2"
+      ORACLE_POOL_MAX: "8"
+    ports:
+      - "8001:8001"
+    networks:
+      - nlsql
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+      start_period: 10s
+
+  oracle-mcp-2:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp-oracle
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      ORACLE_POOL_MIN: "2"
+      ORACLE_POOL_MAX: "8"
+    ports:
+      - "8011:8001"
+    networks:
+      - nlsql
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+      start_period: 10s
+
+  # ── Neo4j MCP replicas ────────────────────────────────────────────────────────
+  neo4j-mcp-1:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp-neo4j
+    restart: unless-stopped
+    env_file: ../../.env
+    ports:
+      - "8002:8002"
+    networks:
+      - nlsql
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+      start_period: 10s
+
+  neo4j-mcp-2:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.mcp-neo4j
+    restart: unless-stopped
+    env_file: ../../.env
+    ports:
+      - "8012:8002"
+    networks:
+      - nlsql
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+      start_period: 10s
+
+  # ── HAProxy load balancer ─────────────────────────────────────────────────────
+  haproxy:
+    image: haproxy:2.9-alpine
+    restart: unless-stopped
+    ports:
+      - "7001:7001"    # Oracle MCP VIP
+      - "7002:7002"    # Neo4j  MCP VIP
+      - "8404:8404"    # HAProxy stats UI
+    volumes:
+      - ./haproxy-compose.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - nlsql
+    depends_on:
+      oracle-mcp-1:
+        condition: service_healthy
+      neo4j-mcp-1:
+        condition: service_healthy
+    healthcheck:
+      test:     ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 10s
+      timeout:  5s
+      retries:  3
+
+  # ── FastAPI backend replicas ──────────────────────────────────────────────────
+  backend-1:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.backend
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      ORACLE_MCP_URL: "http://haproxy:7001"
+      NEO4J_MCP_URL:  "http://haproxy:7002"
+      REDIS_URL:      "redis://redis:6379/0"
+      MCP_POOL_MIN:   "2"
+      MCP_POOL_MAX:   "8"
+    ports:
+      - "8000:8000"
+    networks:
+      - nlsql
+    depends_on:
+      redis:
+        condition: service_healthy
+      haproxy:
+        condition: service_healthy
+    healthcheck:
+      test:     ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 15s
+
+  backend-2:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.backend
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      ORACLE_MCP_URL: "http://haproxy:7001"
+      NEO4J_MCP_URL:  "http://haproxy:7002"
+      REDIS_URL:      "redis://redis:6379/0"
+      MCP_POOL_MIN:   "2"
+      MCP_POOL_MAX:   "8"
+    ports:
+      - "8010:8000"
+    networks:
+      - nlsql
+    depends_on:
+      redis:
+        condition: service_healthy
+      haproxy:
+        condition: service_healthy
+
+  # ── Streamlit frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.frontend
+    restart: unless-stopped
+    environment:
+      # Point at backend-1 by default; add an nginx upstream block in front
+      # of both backends if you want a load-balanced Streamlit → FastAPI path.
+      BACKEND_URL: "http://backend-1:8000"
+    ports:
+      - "8501:8501"
+    networks:
+      - nlsql
+    depends_on:
+      backend-1:
+        condition: service_healthy
