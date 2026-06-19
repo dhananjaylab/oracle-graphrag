@@ -233,4 +233,6 @@ if __name__ == "__main__":
     print(f"[Neo4j MCP]   Health probe : http://{args.host}:{args.port}/health")
     print(f"[Neo4j MCP]   Ready probe  : http://{args.host}:{args.port}/ready")
 
-    mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.run(transport="streamable-http")

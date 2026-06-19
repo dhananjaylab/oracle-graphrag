@@ -268,4 +268,6 @@ if __name__ == "__main__":
     print(f"[Oracle MCP]   Ready probe  : http://{args.host}:{args.port}/ready")
     print(f"[Oracle MCP]   Databases    : {[d.id for d in db_manager.databases]}")
 
-    mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.run(transport="streamable-http")
