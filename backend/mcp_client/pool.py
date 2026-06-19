@@ -1,7 +1,7 @@
 """
-backend/mcp_client/pool.py  (Phase 4C)
+backend/mcp_client/pool.py  (Phase 4C + circuit breaker)
 
-MCPConnectionPool — async connection pool for MCP SSE servers.
+MCPConnectionPool — async connection pool for MCP Streamable HTTP servers.
 
 Replaces the single MCPClientSession + asyncio.Lock design that serialised
 every concurrent request behind one lock. The pool:
@@ -12,6 +12,20 @@ every concurrent request behind one lock. The pool:
   • Validates sessions on check-in; discards dead ones silently.
   • Exposes pool.stats for /api/health reporting.
   • Wraps each tool call with an optional execution timeout.
+
+CHANGED — circuit breaker:
+  Previously, when the backing MCP server was down, every single
+  incoming request independently paid the full checkout timeout
+  (MCP_CHECKOUT_TIMEOUT_S, 10s default) before falling back. Under load
+  that meant N concurrent requests each blocking ~10s, repeatedly, for
+  as long as the outage lasted. The pool now tracks consecutive
+  downstream failures and trips to an OPEN state after
+  MCP_BREAKER_FAILURE_THRESHOLD consecutive failures: while OPEN, calls
+  fail immediately (no checkout attempt at all) for
+  MCP_BREAKER_COOLDOWN_S, then a single HALF_OPEN probe is allowed
+  through to test recovery. Pool exhaustion (all sessions busy but
+  healthy — a capacity problem, not a downstream-health problem) does
+  NOT trip the breaker; only actual call failures/timeouts do.
 
 Usage (in oracle_client / neo4j_client):
     pool = MCPConnectionPool("http://localhost:8001", "oracle", min_size=2, max_size=8)
@@ -37,6 +51,21 @@ _DEFAULT_MIN   = int(os.getenv("MCP_POOL_MIN",   "2"))
 _DEFAULT_MAX   = int(os.getenv("MCP_POOL_MAX",   "8"))
 _CHECKOUT_WAIT = float(os.getenv("MCP_CHECKOUT_TIMEOUT_S", "10"))
 _TOOL_TIMEOUT  = float(os.getenv("MCP_TOOL_TIMEOUT_S",     "60"))
+
+# ── Circuit breaker configuration ───────────────────────────────────────────
+_BREAKER_FAILURE_THRESHOLD = int(os.getenv("MCP_BREAKER_FAILURE_THRESHOLD", "5"))
+_BREAKER_COOLDOWN_S        = float(os.getenv("MCP_BREAKER_COOLDOWN_S", "30"))
+
+
+class PoolExhaustedError(RuntimeError):
+    """
+    Raised when no session could be acquired within the checkout timeout.
+
+    This is a capacity problem on the client side (every session is busy
+    but presumably healthy) — it is intentionally distinct from a tool-call
+    failure so the circuit breaker doesn't mistake "we're just very busy"
+    for "the downstream server is unhealthy".
+    """
 
 
 class _PooledSession:
@@ -66,11 +95,13 @@ class MCPConnectionPool:
         name:       str,
         min_size:   int = _DEFAULT_MIN,
         max_size:   int = _DEFAULT_MAX,
+        auth_token: str | None = None,
     ) -> None:
         self.server_url = server_url.rstrip("/")
         self.name       = name
         self.min_size   = max(1, min_size)
         self.max_size   = max(self.min_size, max_size)
+        self._auth_token = auth_token
 
         self._available: list[_PooledSession] = []
         self._in_use:    list[_PooledSession] = []
@@ -82,6 +113,12 @@ class MCPConnectionPool:
         self._total_errors     = 0
         self._total_created    = 0
         self._total_discarded  = 0
+
+        # Circuit breaker state
+        self._breaker_state: str = "closed"   # "closed" | "open" | "half_open"
+        self._breaker_failures   = 0
+        self._breaker_opened_at: float | None = None
+        self._total_breaker_rejections = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -113,6 +150,62 @@ class MCPConnectionPool:
             self._connected = False
         logger.info("[pool:%s] Disconnected", self.name)
 
+    # ── Circuit breaker ──────────────────────────────────────────────────────
+    #
+    # No `await` inside these methods, so on a single-threaded asyncio event
+    # loop they're effectively atomic with respect to other coroutines —
+    # no extra lock needed for the state transitions themselves.
+
+    def _breaker_allow_request(self) -> bool:
+        """
+        Return True if a call should be attempted right now.
+        Transitions OPEN -> HALF_OPEN once the cooldown elapses, reserving
+        the single half-open probe slot for the caller that triggers it.
+        """
+        if self._breaker_state == "closed":
+            return True
+        if self._breaker_state == "open":
+            if self._breaker_opened_at is None:
+                return True
+            if time.monotonic() - self._breaker_opened_at >= _BREAKER_COOLDOWN_S:
+                self._breaker_state = "half_open"
+                logger.info("[pool:%s] Circuit breaker HALF_OPEN — probing", self.name)
+                return True
+            return False
+        if self._breaker_state == "half_open":
+            # Only the probe that flipped us into half_open gets through;
+            # everyone else still fails fast until it resolves.
+            return False
+        return True
+
+    def _breaker_record_success(self) -> None:
+        if self._breaker_state != "closed":
+            logger.info("[pool:%s] Circuit breaker CLOSED — recovered", self.name)
+        self._breaker_state    = "closed"
+        self._breaker_failures = 0
+        self._breaker_opened_at = None
+
+    def _breaker_record_failure(self) -> None:
+        self._breaker_failures += 1
+        if self._breaker_state == "half_open":
+            # Probe failed — reopen and restart the cooldown window.
+            self._breaker_state     = "open"
+            self._breaker_opened_at = time.monotonic()
+            logger.warning("[pool:%s] Circuit breaker re-OPENED — probe failed", self.name)
+        elif self._breaker_failures >= _BREAKER_FAILURE_THRESHOLD and self._breaker_state == "closed":
+            self._breaker_state     = "open"
+            self._breaker_opened_at = time.monotonic()
+            logger.warning(
+                "[pool:%s] Circuit breaker OPEN after %d consecutive failures — "
+                "failing fast for %.0fs instead of retrying",
+                self.name, self._breaker_failures, _BREAKER_COOLDOWN_S,
+            )
+
+    def _breaker_remaining_cooldown(self) -> float:
+        if self._breaker_opened_at is None or self._breaker_state != "open":
+            return 0.0
+        return max(0.0, _BREAKER_COOLDOWN_S - (time.monotonic() - self._breaker_opened_at))
+
     # ── Public interface ───────────────────────────────────────────────────────
 
     async def call_tool(
@@ -123,9 +216,20 @@ class MCPConnectionPool:
     ) -> Any:
         """
         Check out a session, call the tool, return the session.
-        Raises RuntimeError on timeout or repeated failure.
+        Raises RuntimeError on timeout or repeated failure;
+        raises PoolExhaustedError specifically if no session is free.
         """
         self._total_calls += 1
+
+        if not self._breaker_allow_request():
+            self._total_errors += 1
+            self._total_breaker_rejections += 1
+            raise RuntimeError(
+                f"[pool:{self.name}] Circuit breaker OPEN — failing fast "
+                f"({self._breaker_failures} consecutive failures, "
+                f"~{self._breaker_remaining_cooldown():.0f}s until retry probe)"
+            )
+
         try:
             async with self._checkout_session() as ps:
                 try:
@@ -133,16 +237,24 @@ class MCPConnectionPool:
                         ps.session.call_tool(tool_name, arguments),
                         timeout=timeout_s,
                     )
-                    return result
                 except asyncio.TimeoutError:
                     # Mark session as bad so check-in discards it
                     await ps.session.disconnect()
                     raise RuntimeError(
                         f"[pool:{self.name}] {tool_name} timed out after {timeout_s}s"
                     )
-        except Exception:
+        except PoolExhaustedError:
+            # Capacity problem, not a downstream-health problem — counted
+            # as an error for stats, but deliberately doesn't trip the breaker.
             self._total_errors += 1
             raise
+        except Exception:
+            self._total_errors += 1
+            self._breaker_record_failure()
+            raise
+        else:
+            self._breaker_record_success()
+            return result
 
     async def ping(self) -> bool:
         """Return True if at least one session in the pool is reachable."""
@@ -167,6 +279,10 @@ class MCPConnectionPool:
             "error_rate":      round(
                 self._total_errors / self._total_calls, 4
             ) if self._total_calls else 0.0,
+            "breaker_state":                self._breaker_state,
+            "breaker_consecutive_failures": self._breaker_failures,
+            "breaker_rejections":           self._total_breaker_rejections,
+            "breaker_cooldown_remaining_s": round(self._breaker_remaining_cooldown(), 1),
         }
 
     # ── Internal helpers ───────────────────────────────────────────────────────
@@ -207,7 +323,7 @@ class MCPConnectionPool:
             # Nothing available — wait briefly and retry
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(
+                raise PoolExhaustedError(
                     f"[pool:{self.name}] Pool exhausted — no session available "
                     f"after {timeout}s (max_size={self.max_size})"
                 )
@@ -235,7 +351,7 @@ class MCPConnectionPool:
 
     async def _create_session(self) -> "_PooledSession | None":
         """Create and connect a single new MCPClientSession. Returns None on failure."""
-        session = MCPClientSession(self.server_url, name=self.name)
+        session = MCPClientSession(self.server_url, name=self.name, auth_token=self._auth_token)
         try:
             await session.connect()
             self._total_created += 1

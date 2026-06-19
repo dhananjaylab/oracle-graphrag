@@ -1,11 +1,22 @@
 """
 mcp_servers/neo4j_mcp/server.py  (Phase 4A — adds get_join_paths_batch)
+                                  (+ Streamable HTTP / stateless migration)
 
 Phase 4A change: new get_join_paths_batch tool that finds FK join paths
 between ALL pairs of candidate tables in a single Cypher query, replacing
 the N−1 sequential get_join_path loop in the query pipeline.
 
-All existing tools are unchanged.
+Streamable HTTP migration — same rationale as mcp_servers/oracle_mcp/server.py:
+  • Built on the official SDK's `mcp.server.fastmcp.FastMCP` rather than the
+    third-party `fastmcp` package, for a stable, documented host/port/
+    stateless_http/json_response API.
+  • stateless_http=True removes the in-memory session pinning that SSE
+    required, so this server can sit behind a plain round-robin load
+    balancer with multiple replicas — no sticky sessions, no shared
+    session store.
+  • Endpoint moves from /sse to /mcp.
+
+All tool behavior is unchanged from the SSE version.
 """
 
 import json
@@ -19,10 +30,14 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 import backend.services.neo4j_service as neo4j_svc
 
-mcp = FastMCP(name="neo4j-mcp-server")
+mcp = FastMCP(
+    name           = "neo4j-mcp-server",
+    stateless_http = True,
+    json_response  = True,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -96,7 +111,7 @@ async def get_join_path(table1: str, table2: str, database_id: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TOOL: get_join_paths_batch  (Phase 4A — NEW)
+# TOOL: get_join_paths_batch  (Phase 4A)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
@@ -285,5 +300,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8002)
     args = parser.parse_args()
 
-    print(f"[Neo4j MCP] Starting on {args.host}:{args.port}")
-    mcp.run(transport="sse", host=args.host, port=args.port)
+    print(f"[Neo4j MCP] Starting on {args.host}:{args.port} "
+          f"(transport=streamable-http, stateless_http=True)")
+    print(f"[Neo4j MCP] MCP endpoint: http://{args.host}:{args.port}/mcp")
+
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.stateless_http = True
+    mcp.run(transport="streamable-http")

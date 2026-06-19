@@ -1,13 +1,42 @@
 """
 mcp_servers/oracle_mcp/server.py
 
-Oracle MCP Server — Phase 3B
+Oracle MCP Server — Phase 3B (+ Streamable HTTP / stateless migration)
 Exposes Oracle database capabilities as MCP tools callable by any
 MCP-compatible client (FastAPI backend, future supervisor agents,
 Claude Desktop, etc.).
 
-Transport: SSE  (default port 8001)
+Transport: Streamable HTTP, stateless — mounted at /mcp by default.
+────────────────────────────────────────────────────────────────────
+CHANGED from the original SSE implementation:
+
+  • Server now built on the official SDK's `mcp.server.fastmcp.FastMCP`
+    instead of the third-party `fastmcp` package. The official SDK is
+    the canonical implementation of stateless_http / json_response, so
+    there's no cross-package ambiguity about whether those flags exist
+    or behave consistently — the third-party package's host/port
+    handling has changed shape across its own major versions, which is
+    exactly the kind of churn you don't want underneath a production
+    service boundary.
+
+  • stateless_http=True: the server keeps no in-memory session pinned
+    to a single process. Any replica can serve any request, which is
+    what makes a plain round-robin load balancer (HAProxy / Envoy /
+    nginx / a k8s Service) work in front of multiple instances of this
+    server, with no sticky-session configuration and no shared session
+    store. This is the single change that unlocks horizontal scaling
+    of this tier.
+
+  • json_response=True: plain JSON responses for calls that don't need
+    server-initiated streaming — cheaper to parse and easier to log/
+    cache at a gateway than SSE framing.
+
+  • Endpoint moves from /sse to /mcp (the Streamable HTTP default mount
+    path). Update any firewall rules, load balancer health checks, or
+    docs that reference the old /sse path.
+
 All tools return JSON strings — the MCP client deserializes on its end.
+Tool behavior is unchanged from the SSE version.
 
 Tools
 ─────
@@ -37,16 +66,18 @@ if str(ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
-# fastmcp>=0.2.0from mcp.server.fastmcp import FastMCP
-
-from fastmcp import FastMCP
+# Official SDK's high-level server — see module docstring for why this
+# replaces the third-party `fastmcp` import used previously.
+from mcp.server.fastmcp import FastMCP
 
 from backend.db_manager import db_manager
 from backend.services import oracle_service
 
 # ── Server instance ────────────────────────────────────────────────────────────
 mcp = FastMCP(
-    name        = "oracle-mcp-server",
+    name           = "oracle-mcp-server",
+    stateless_http = True,
+    json_response  = True,
     # description = (
     #     "Banking Oracle DB gateway — exposes read-only query execution, "
     #     "EXPLAIN PLAN cost estimation, and enriched schema metadata. "
@@ -293,8 +324,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
 
-    print(f"[Oracle MCP] Starting on {args.host}:{args.port}")
+    print(f"[Oracle MCP] Starting on {args.host}:{args.port} "
+          f"(transport=streamable-http, stateless_http=True)")
+    print(f"[Oracle MCP] MCP endpoint: http://{args.host}:{args.port}/mcp")
     print(f"[Oracle MCP] Registered databases: "
           f"{[d.id for d in db_manager.databases]}")
 
-    mcp.run(transport="sse", host=args.host, port=args.port)
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+    mcp.settings.stateless_http = True
+    mcp.run(transport="streamable-http")
