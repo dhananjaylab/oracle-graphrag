@@ -1,12 +1,13 @@
 """
-backend/routes/schema.py  (v2 + Phase 3A feedback + Phase 3B MCP routing + Phase 4B)
+backend/routes/schema.py  (v2 + Phase 3A feedback + Phase 3B MCP routing + Phase 4B + Phase 4E)
 
-Phase 4B change:
-  POST /api/feedback with action="correct" now also invalidates the
-  result_cache and schema_cache for the affected database, ensuring
-  future queries re-execute rather than serving stale cached results.
+Phase 4E fix: cache invalidation on action="correct" now uses the async
+ainvalidate_db() methods so the invalidation actually reaches Redis, not
+just the local L1 dict on whichever replica handled this request. Without
+this, a correction submitted against replica A would leave replica B (and
+Redis) still serving the old, now-known-wrong cached result.
 
-GET /api/health now includes pool stats and cache stats from Phase 4.
+GET /api/health includes pool stats and cache stats from Phase 4.
 """
 
 from fastapi import APIRouter
@@ -145,7 +146,7 @@ async def examples():
     return {"examples": EXAMPLE_QUESTIONS}
 
 
-# ── Feedback (Phase 3A + 3B + Phase 4B cache invalidation) ────────────────────
+# ── Feedback (Phase 3A + 3B + Phase 4B cache invalidation + Phase 4E fix) ─────
 
 @router.post("/feedback")
 async def feedback(request: FeedbackRequest):
@@ -156,6 +157,10 @@ async def feedback(request: FeedbackRequest):
     the result_cache and schema_cache for this database so future
     identical queries re-execute with fresh data rather than serving
     a result that was based on wrong SQL.
+
+    Phase 4E fix: invalidation now goes through ainvalidate_db() so the
+    Redis-backed L2 cache is actually cleared too, not just this
+    replica's local L1 dict.
 
     rating ≥ 4  (thumbs up)  → action="increment"  success_count + 1
     rating < 4  (thumbs down) → action="decrement"  success_count - 1
@@ -186,9 +191,9 @@ async def feedback(request: FeedbackRequest):
             action        = "correct",
             corrected_sql = corrected,
         )
-        # Phase 4B: invalidate stale cached results for this database
-        n_result = result_cache.invalidate_db(request.db_id)
-        n_schema = schema_cache.invalidate_db(request.db_id)
+        # Phase 4E: invalidate stale cached results in BOTH local L1 and Redis L2
+        n_result = await result_cache.ainvalidate_db(request.db_id)
+        n_schema = await schema_cache.ainvalidate_db(request.db_id)
         cache_invalidated = True
 
     return {
