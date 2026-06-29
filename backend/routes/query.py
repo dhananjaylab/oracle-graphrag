@@ -1,36 +1,28 @@
 """
-backend/routes/query.py  (Phase 4A + 4B)
+backend/routes/query.py  (Phase 4A + 4B + Phase 4E cache-wiring fix)
 
-Phase 4A — parallel pipeline:
-  Steps 3 + 4  search_patterns + semantic_search run with asyncio.gather
-  Steps 6 + 7  get_join_paths_batch + get_cross_db_hints run with asyncio.gather
-               (batch join replaces the previous O(N) sequential loop)
+Phase 4E fix: all cache.py calls now use the async (aget/aset/ainvalidate_db)
+variants instead of the sync ones. The sync variants only ever touch the
+local L1 dict and never reach Redis — so calling them here meant the Redis
+backend added in cache.py was connected but never actually exercised by the
+query pipeline. This was the gap caught during the phase-3 integration
+review: Redis was live, but every FastAPI replica still had its own private
+L1-only cache, which defeats the entire point of adding a shared L2.
 
-Phase 4B — three caches:
-  EmbeddingCache  — skip Gemini embed API for repeated questions
-  SchemaCache     — skip Neo4j table_details + join_paths for known table sets
-  ResultCache     — skip Oracle execution for identical SQL within TTL
-
-Schema context token budget:
-  _trim_schema_context() drops low-priority tables when the assembled
-  context would exceed MAX_SCHEMA_TOKENS, always preserving PKs and
-  indexed columns on tables that remain.
-
-All Phase 3A/3B agent behaviour (ValidationAgent, SelfHealingAgent,
-MCP fallbacks) is preserved unchanged.
+Every other line of behaviour is unchanged from the previous version.
 
 Pipeline steps
 ──────────────
  1.  Resolve db_id
- 2.  Embed question              embedding_cache → gemini_service.get_embedding
+ 2.  Embed question              embedding_cache.aget → gemini_service.get_embedding
 [P]  3+4. search_patterns + semantic_search     asyncio.gather (parallel)
- 5.  Get table details           schema_cache → neo4j_mcp.get_table_details
+ 5.  Get table details           schema_cache.aget_details → neo4j_mcp.get_table_details
 [P]  6+7. get_join_paths_batch + get_cross_db_hints  asyncio.gather
  8.  Build schema context        (local, token-budget trimmed)
  9.  Generate SQL                gemini_service.generate_sql
 [3A] 10. ValidationAgent
 [3A] 10a. SelfHealingAgent       triggered on validation / Oracle failure
-[4B] 11. result_cache check      skip Oracle if identical SQL seen recently
+[4B] 11. result_cache.aget check      skip Oracle if identical SQL seen recently
  11. Execute SQL                 oracle_mcp.execute_query
  12. Build output
  13. Summarize results           gemini_service.summarize_results
@@ -89,13 +81,13 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
         "result":    False,
     }
 
-    # ── Step 2: Embed question (with EmbeddingCache) ─────────────────────────
-    query_embedding: list[float] | None = embedding_cache.get(request.question)
+    # ── Step 2: Embed question (EmbeddingCache — L1 local + L2 Redis) ───────
+    query_embedding: list[float] | None = await embedding_cache.aget(request.question)
     if query_embedding is None:
         query_embedding = await asyncio.to_thread(
             gemini_service.get_embedding, request.question
         )
-        embedding_cache.set(request.question, query_embedding)
+        await embedding_cache.aset(request.question, query_embedding)
     else:
         cache_flags["embedding"] = True
 
@@ -151,19 +143,19 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
             "No relevant tables found. Run: python -m ingestion.ingest_schema",
         )
 
-    # ── Step 5: Table details (SchemaCache) ──────────────────────────────────
-    table_details: list[dict] | None = schema_cache.get_details(db_id, candidate_tables)
+    # ── Step 5: Table details (SchemaCache — L1 local + L2 Redis) ────────────
+    table_details: list[dict] | None = await schema_cache.aget_details(db_id, candidate_tables)
     if table_details is None:
         table_details = await neo4j_mcp.get_table_details(
             table_names = candidate_tables,
             database_id = db_id,
         )
-        schema_cache.set_details(db_id, candidate_tables, table_details)
+        await schema_cache.aset_details(db_id, candidate_tables, table_details)
     else:
         cache_flags["schema"] = True
 
     # ── Steps 6 + 7: PARALLEL — get_join_paths_batch + get_cross_db_hints ───
-    join_paths_cached = schema_cache.get_join_paths(db_id, candidate_tables)
+    join_paths_cached = await schema_cache.aget_join_paths(db_id, candidate_tables)
 
     if len(candidate_tables) > 1:
         if join_paths_cached is not None:
@@ -185,7 +177,7 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
                     database_id = db_id,
                 ),
             )
-            schema_cache.set_join_paths(db_id, candidate_tables, join_paths_raw)
+            await schema_cache.aset_join_paths(db_id, candidate_tables, join_paths_raw)
             cypher_log.append(
                 "-- Join paths batch (parallel, Neo4j MCP: get_join_paths_batch):\n"
                 "shortestPath via [:FK_TO*1..5] — all table pairs in one query"
@@ -299,8 +291,8 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
     if val_result.valid:
         sql = val_result.sql   # limit-injected + PII-masked
 
-        # ── Result cache check ────────────────────────────────────────────
-        cached_result = result_cache.get(db_id, sql)
+        # ── Result cache check (L1 local + L2 Redis) ───────────────────────
+        cached_result = await result_cache.aget(db_id, sql)
         if cached_result is not None:
             exec_result       = cached_result
             from_result_cache = True
@@ -313,7 +305,7 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
                 if "error" in exec_result:
                     raise RuntimeError(exec_result["error"])
                 # Populate result cache on success
-                result_cache.set(db_id, sql, exec_result)
+                await result_cache.aset(db_id, sql, exec_result)
             except Exception as exc:
                 oracle_error = str(exc)
                 warnings.append(
@@ -337,7 +329,7 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
                         sql=sql, tables_used=candidate_tables, agent_trace=agent_trace,
                     )
                 # Cache the healed result too
-                result_cache.set(db_id, sql, exec_result)
+                await result_cache.aset(db_id, sql, exec_result)
     else:
         val_error = val_result.error_summary
         warnings.append(f"Validation failed: {val_error}. Attempting recovery…")
@@ -358,7 +350,7 @@ async def query(request: QueryRequest, background_tasks: BackgroundTasks):
                 f"Could not generate valid SQL after {len(heal_attempts)} attempt(s).",
                 sql=sql, tables_used=candidate_tables, agent_trace=agent_trace,
             )
-        result_cache.set(db_id, sql, exec_result)
+        await result_cache.aset(db_id, sql, exec_result)
 
     if not from_result_cache:
         exec_ms = int((time.monotonic() - exec_start) * 1000)
