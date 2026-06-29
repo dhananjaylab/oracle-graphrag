@@ -1,5 +1,18 @@
 # docker-compose.yml — NL-SQL full production stack
 #
+# Phase 4E fix: this file previously assumed it lived two directories below
+# repo root (infra/docker/docker-compose.yml), so `context: ../..` and
+# `dockerfile: infra/docker/Dockerfile.X` correctly walked back up to the
+# project root. The repo flattened the infra/ nesting and put this file
+# directly at repo root instead — but the path references inside it weren't
+# updated to match, so `context: ../..` walked OUTSIDE the project entirely
+# and `dockerfile: infra/docker/Dockerfile.X` pointed at a directory that
+# doesn't exist in this layout. `docker compose up --build` would fail
+# immediately on this as it was. Fixed below: context is now `.` (repo
+# root, since this file lives there) and dockerfile paths are root-relative,
+# matching where Dockerfile.mcp-oracle / Dockerfile.mcp-neo4j /
+# Dockerfile.backend / Dockerfile.frontend actually live in this repo.
+#
 # Services:
 #   redis          — shared cache backing store for all FastAPI replicas
 #   oracle-mcp-1   — Oracle MCP server replica 1
@@ -11,7 +24,7 @@
 #   backend-2      — FastAPI app replica 2
 #   frontend       — Streamlit UI
 #
-# Usage:
+# Usage (run from repo root):
 #   docker compose up --build
 #   docker compose up --scale oracle-mcp=3 --scale neo4j-mcp=3  (if using
 #   profiles instead of named replicas)
@@ -58,10 +71,10 @@ services:
   # ── Oracle MCP replicas ───────────────────────────────────────────────────────
   oracle-mcp-1:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.mcp-oracle
+      context: .
+      dockerfile: Dockerfile.mcp-oracle
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     environment:
       ORACLE_POOL_MIN: "2"
       ORACLE_POOL_MAX: "8"
@@ -78,10 +91,10 @@ services:
 
   oracle-mcp-2:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.mcp-oracle
+      context: .
+      dockerfile: Dockerfile.mcp-oracle
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     environment:
       ORACLE_POOL_MIN: "2"
       ORACLE_POOL_MAX: "8"
@@ -99,10 +112,10 @@ services:
   # ── Neo4j MCP replicas ────────────────────────────────────────────────────────
   neo4j-mcp-1:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.mcp-neo4j
+      context: .
+      dockerfile: Dockerfile.mcp-neo4j
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     ports:
       - "8002:8002"
     networks:
@@ -116,10 +129,10 @@ services:
 
   neo4j-mcp-2:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.mcp-neo4j
+      context: .
+      dockerfile: Dockerfile.mcp-neo4j
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     ports:
       - "8012:8002"
     networks:
@@ -157,10 +170,10 @@ services:
   # ── FastAPI backend replicas ──────────────────────────────────────────────────
   backend-1:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.backend
+      context: .
+      dockerfile: Dockerfile.backend
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     environment:
       ORACLE_MCP_URL: "http://haproxy:7001"
       NEO4J_MCP_URL:  "http://haproxy:7002"
@@ -185,10 +198,10 @@ services:
 
   backend-2:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.backend
+      context: .
+      dockerfile: Dockerfile.backend
     restart: unless-stopped
-    env_file: ../../.env
+    env_file: .env
     environment:
       ORACLE_MCP_URL: "http://haproxy:7001"
       NEO4J_MCP_URL:  "http://haproxy:7002"
@@ -208,8 +221,8 @@ services:
   # ── Streamlit frontend ────────────────────────────────────────────────────────
   frontend:
     build:
-      context: ../..
-      dockerfile: infra/docker/Dockerfile.frontend
+      context: .
+      dockerfile: Dockerfile.frontend
     restart: unless-stopped
     environment:
       # Point at backend-1 by default; add an nginx upstream block in front

@@ -15,6 +15,11 @@ forwarded to every pooled session as an Authorization header. This is
 plumbing for a service-to-service token today; a full OAuth 2.1 client
 flow (mcp.client.auth.OAuthClientProvider) is a separate piece of work
 if/when interactive user-delegated auth to the MCP server is needed.
+
+NOTE (phase-3 review): this file came through as a binary blob in the
+repo dump submitted for review, so its actual current content couldn't
+be directly verified against this known-good version. Diff before
+overwriting in case local edits were made that aren't reflected here.
 """
 
 from __future__ import annotations

@@ -1,11 +1,16 @@
 """
-backend/routes/supervisor.py  (Phase 3C)
+backend/routes/supervisor.py  (Phase 3C + Phase 4E cache-wiring fix)
 
 POST /api/supervisor  — SSE streaming endpoint.
 
 Streams SupervisorEvents as Server-Sent Events while the
 Gemini supervisor loop runs. Each event is a named SSE frame
 the Streamlit frontend consumes with httpx streaming.
+
+Phase 4E fix: the supervisor path previously called gemini_service.get_embedding()
+directly on every request, bypassing embedding_cache entirely — the linear
+/api/query pipeline got cache benefit for repeated/similar questions but the
+supervisor path never did. Now both paths share the same cache.
 
 SSE frame format:
     event: <event_type>
@@ -31,6 +36,7 @@ from fastapi.responses import StreamingResponse
 
 from backend.db_manager import db_manager
 from backend.agents.supervisor_agent import supervisor_agent
+from backend.cache import embedding_cache
 from backend.models import SupervisorRequest
 from backend.services.gemini_service import get_embedding
 
@@ -63,11 +69,15 @@ async def _stream_supervisor(request: SupervisorRequest) -> AsyncGenerator[str, 
     """
     Async generator that runs the supervisor and yields SSE-formatted strings.
     """
-    # ── Pre-compute embedding (before starting the supervisor loop) ────────
+    # ── Pre-compute embedding (EmbeddingCache — L1 local + L2 Redis) ───────
+    # Phase 4E: was a direct get_embedding() call with no cache lookup at all.
     try:
-        query_embedding: list[float] = await asyncio.to_thread(
-            get_embedding, request.question
-        )
+        query_embedding: list[float] | None = await embedding_cache.aget(request.question)
+        if query_embedding is None:
+            query_embedding = await asyncio.to_thread(
+                get_embedding, request.question
+            )
+            await embedding_cache.aset(request.question, query_embedding)
     except Exception as exc:
         yield _sse("error", {"message": f"Embedding failed: {exc}"})
         return
