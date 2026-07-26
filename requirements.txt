@@ -1,49 +1,8 @@
-# ── Web framework ──────────────────────────────────────────────────────────────
-fastapi>=0.115.0
-uvicorn[standard]>=0.31.1
-
-# ── Oracle DB driver — thin mode, no Oracle Instant Client ─────────────────────
-oracledb==4.0.0
-
-# ── Neo4j graph driver — 5.11+ for vector index support ───────────────────────
-neo4j==5.19.0
-
-# ── Google Gemini SDK — function calling used by Phase 3C supervisor ──────────
-google-generativeai==0.7.2
-
-# ── MCP SDK — Streamable HTTP transport (stateless) ────────────────────────────
-# Both the Oracle/Neo4j MCP servers and the FastAPI backend's MCP clients now
-# use the official `mcp` SDK exclusively:
-#   • Servers: mcp.server.fastmcp.FastMCP (stateless_http=True, json_response=True)
-#   • Clients: mcp.client.streamable_http.streamablehttp_client
-# The third-party `fastmcp` package is no longer used — standardizing on the
-# official SDK avoids relying on a second package's host/port/transport API,
-# which has changed shape across its own major versions. Verify this floor
-# against the latest published 1.x release before pinning a CI lockfile.
-mcp[cli]>=1.28.0,<2.0.0
-
-# ── Config + YAML ──────────────────────────────────────────────────────────────
-pydantic-settings>=2.6.1
-python-dotenv==1.0.1
-PyYAML==6.0.1
-
-# ── HTTP client — Streamlit → FastAPI, MCP Streamable HTTP transport ──────────
-httpx>=0.28.1
-httpx-sse==0.4.0
-
-# ── Frontend ───────────────────────────────────────────────────────────────────
-streamlit==1.35.0
-
-# ── Data handling + output ─────────────────────────────────────────────────────
-pandas==2.2.2
-plotly==5.22.0
-openpyxl==3.1.2
-
-# ── Phase 3A: SQL validation — sqlglot Oracle dialect ─────────────────────────
-sqlglot==25.5.0
-
-# ── Redis client — shared cache across FastAPI replicas ────────────────────────
-# redis.asyncio is the async interface shipped inside redis-py >= 4.2.
-# If REDIS_URL is not set in .env, cache.py falls back to in-process dicts
-# automatically — this package is optional for local dev.
-redis>=4.6.0
+google-generativeai>=0.8.0
+mcp>=1.6.0
+oracledb>=3.1.1
+numpy>=1.24.0
+rapidfuzz>=3.13.0
+python-dotenv>=1.0.0
+google-genai
+python-decouple
